@@ -1,0 +1,30 @@
+name: build-core-preview
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            script: powershell -ExecutionPolicy Bypass -File scripts/build_windows.ps1
+            artifact: dist/ETFPlanAssistant-Core.exe
+          - os: macos-latest
+            script: bash scripts/build_macos.sh
+            artifact: dist/ETFPlanAssistant-Core.dmg
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: ${{ matrix.script }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: core-preview-${{ runner.os }}
+          path: ${{ matrix.artifact }}
+

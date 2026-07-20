@@ -1,0 +1,16 @@
+{
+  "levels": [
+    {
+      "threshold": 12,
+      "multiplier": 1.5,
+      "execution_mode": "once",
+      "note": "示例档位，请按自己的规则调整"
+    },
+    {
+      "threshold": 20,
+      "multiplier": 2.25,
+      "execution_mode": "weekly_while_deep",
+      "note": "示例深度回撤档位"
+    }
+  ]
+}

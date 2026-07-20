@@ -1,0 +1,91 @@
+# ETF Plan Assistant
+
+本地运行的 ETF 定投与回撤提醒工具。它使用场内 ETF 行情作为信号，为对应的场外联接基金计算用户自己预设的计划金额；系统只提醒，不自动交易。
+
+当前仓库是可运行的开发版，已包含简约 PySide6 桌面界面。EXE/DMG 自动构建与更多通知配置界面仍会继续完善。
+
+## 已实现
+
+- 每只基金独立配置回撤档位、补仓倍数和执行方式；
+- 原始默认策略：`5%×1、8%×1、10%×2、15%两期×1、20%每周×1`；
+- 策略版本和“立即生效/下一回撤周期生效”；
+- 最近 20 个已完成交易日最高收盘价回撤计算；
+- 同日幂等、同周提醒限制和通知送达闭环；
+- SQLite 本地存储；
+- macOS 桌面通知、Windows Toast、SMTP 邮件、企业微信 Webhook 适配器；
+- `.etfbak` 完整导出、校验、恢复和幂等合并；
+- macOS `launchd` 与 Windows 任务计划定义；
+- AKShare 行情适配器和可替换接口；
+- 自动化测试。
+- 简约桌面界面：今日概览、计划管理、自定义策略、提醒历史、迁移和通知开关。
+
+## 开发环境
+
+```bash
+python -m venv .venv
+source .venv/bin/activate        # macOS
+# .venv\Scripts\activate         # Windows PowerShell
+python -m pip install -e ".[dev,market,desktop]"
+python -m unittest discover -s tests -v
+```
+
+启动桌面界面：
+
+```bash
+etf-assistant-ui
+# 或：python -m etf_assistant.gui
+```
+
+## 命令行快速验证
+
+```bash
+etf-assistant init
+
+etf-assistant add-plan \
+  --name "A500" \
+  --purchase-code 022459 \
+  --signal-code 159361 \
+  --base-amount 600
+
+etf-assistant list-plans
+etf-assistant export ~/Desktop/etf-backup.etfbak
+etf-assistant validate-backup ~/Desktop/etf-backup.etfbak
+```
+
+自定义恒生科技档位可传入 JSON：
+
+```json
+{
+  "levels": [
+    {"threshold": 12, "multiplier": 1.5},
+    {"threshold": 20, "multiplier": 2.25}
+  ]
+}
+```
+
+```bash
+etf-assistant add-plan \
+  --name "恒生科技" \
+  --purchase-code 012349 \
+  --signal-code 513180 \
+  --base-amount 300 \
+  --strategy-json hengsheng-tech.json
+```
+
+## 文档
+
+- [完整产品需求文档](docs/PRD.md)
+- [开发指南](docs/development.md)
+- [macOS 部署](docs/macos-installation.md)
+- [Windows 部署](docs/windows-installation.md)
+- [通知配置](docs/notification-setup.md)
+- [备份与迁移](docs/backup-and-migration.md)
+- [故障排查](docs/troubleshooting.md)
+
+## 安全边界
+
+- 不连接支付宝或券商交易账户；
+- 不保存邮箱密码和微信 Webhook 到 SQLite 或迁移包；
+- 密钥进入 macOS Keychain 或 Windows Credential Manager；
+- 场内 ETF 行情只用于规则计算，不代表场外基金最终净值；
+- 不保证收益，不构成投资建议。
