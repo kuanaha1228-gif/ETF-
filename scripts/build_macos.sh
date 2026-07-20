@@ -7,7 +7,8 @@ python -m PyInstaller \
   --windowed \
   --name "ETF Plan Assistant" \
   --collect-all akshare \
-  --collect-all keyring \
+  --collect-all py_mini_racer \
+  --add-data "src/etf_assistant/web:etf_assistant/web" \
   src/etf_assistant/gui_entry.py
 rm -rf dist/dmg-root
 mkdir -p dist/dmg-root

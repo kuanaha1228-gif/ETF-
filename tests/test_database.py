@@ -1,4 +1,5 @@
 import tempfile
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from unittest import TestCase
@@ -36,6 +37,29 @@ class DatabaseTests(TestCase):
         self.assertEqual(loaded.levels[0].threshold, Decimal("12"))
         self.assertEqual(loaded.levels[0].multiplier, Decimal("1.5"))
 
+    def test_market_snapshot_is_persisted_for_dashboard(self) -> None:
+        plan = Plan("A500", "022459", "159361", Decimal("600"))
+        self.database.add_plan_with_strategy(plan, default_strategy(plan.id))
+        timestamp = datetime.now().astimezone()
+        self.database.save_market_snapshot(
+            plan_id=plan.id,
+            quote_price=Decimal("1.234"),
+            quote_time=timestamp,
+            daily_change=Decimal("0.8"),
+            highest_close=Decimal("1.300"),
+            drawdown=Decimal("5.0769"),
+        )
+        row = self.database.market_snapshots()[0]
+        self.assertEqual(row["quote_price"], "1.234")
+        self.assertEqual(row["drawdown"], "5.0769")
+
+    def test_schema_one_database_migrates_market_snapshots(self) -> None:
+        with self.database.transaction() as connection:
+            connection.execute("DROP TABLE market_snapshots")
+            connection.execute("PRAGMA user_version = 1")
+        self.database.initialize()
+        self.assertIn("market_snapshots", self.database.count_rows())
+
     def test_next_cycle_strategy_activates_after_recovery(self) -> None:
         plan = Plan("A500", "022459", "159361", Decimal("600"))
         initial = default_strategy(plan.id)
@@ -54,7 +78,7 @@ class DatabaseTests(TestCase):
 
     def test_sensitive_setting_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
-            self.database.set_setting("wechat.webhook", "must-not-enter-sqlite")
+            self.database.set_setting("smtp.password", "must-not-enter-sqlite")
 
     def test_event_action_preserves_snapshot_and_writes_audit(self) -> None:
         plan = Plan("A500", "022459", "159361", Decimal("600"))

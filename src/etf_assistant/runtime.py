@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass, replace
 from datetime import datetime, time
 from pathlib import Path
@@ -7,12 +9,11 @@ from zoneinfo import ZoneInfo
 
 from .config import app_data_dir
 from .db import Database
-from .providers.credentials import CredentialStore, KeyringCredentialStore
+from .providers.credentials import CredentialStore, LocalCredentialStore
 from .providers.market import AkshareMarketProvider, AkshareTradingCalendar
 from .providers.notify import (
     NotificationProvider,
     SmtpEmailNotifier,
-    WeComWebhookNotifier,
     desktop_notifier,
 )
 from .service import CheckResult, DailyCheckService
@@ -31,7 +32,7 @@ def setting_bool(database: Database, key: str, default: bool = False) -> bool:
 def build_notifiers(
     database: Database, credentials: CredentialStore | None = None
 ) -> list[NotificationProvider]:
-    credentials = credentials or KeyringCredentialStore()
+    credentials = credentials or LocalCredentialStore()
     notifiers: list[NotificationProvider] = []
     if setting_bool(database, "notification.desktop.enabled", True):
         notifiers.append(desktop_notifier())
@@ -55,17 +56,13 @@ def build_notifiers(
                     use_ssl=setting_bool(database, "smtp.use_ssl", True),
                 )
             )
-    if setting_bool(database, "notification.wechat.enabled"):
-        webhook = credentials.get("wechat.webhook")
-        if webhook:
-            notifiers.append(WeComWebhookNotifier(webhook))
     return notifiers
 
 
 def notification_configuration_errors(
     database: Database, credentials: CredentialStore | None = None
 ) -> tuple[str, ...]:
-    credentials = credentials or KeyringCredentialStore()
+    credentials = credentials or LocalCredentialStore()
     errors: list[str] = []
     if setting_bool(database, "notification.email.enabled"):
         required = ("smtp.host", "smtp.username", "smtp.sender", "smtp.recipient")
@@ -74,8 +71,6 @@ def notification_configuration_errors(
             missing.append("smtp.password")
         if missing:
             errors.append("email needs configuration: " + ", ".join(missing))
-    if setting_bool(database, "notification.wechat.enabled") and not credentials.get("wechat.webhook"):
-        errors.append("WeChat needs configuration: wechat.webhook")
     return tuple(errors)
 
 
@@ -89,14 +84,28 @@ class ProcessLock:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if self.path.exists():
             age = datetime.now().timestamp() - self.path.stat().st_mtime
-            if age <= self.stale_seconds:
+            try:
+                owner = json.loads(self.path.read_text(encoding="utf-8"))
+                pid = int(owner["pid"])
+            except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+                pid = 0
+            running = False
+            if pid:
+                try:
+                    os.kill(pid, 0)
+                    running = True
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    running = True
+            if running and age <= self.stale_seconds:
                 raise RuntimeError("another daily check is already running")
             self.path.unlink(missing_ok=True)
         try:
             descriptor = self.path.open("x", encoding="utf-8")
         except FileExistsError as error:
             raise RuntimeError("another daily check is already running") from error
-        descriptor.write(str(datetime.now().astimezone()))
+        descriptor.write(json.dumps({"pid": os.getpid(), "started_at": str(datetime.now().astimezone())}))
         descriptor.close()
         self.acquired = True
         return self

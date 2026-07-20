@@ -7,7 +7,7 @@ etf-assistant export ~/Desktop/etf-assistant.etfbak
 etf-assistant validate-backup ~/Desktop/etf-assistant.etfbak
 ```
 
-迁移包包含计划、策略版本、历史事件、通知状态、执行记录和非敏感设置。SMTP 密码和微信 Webhook 不会导出。
+迁移包包含计划、策略版本、历史事件、通知状态、执行记录和非敏感设置。SMTP 密码或授权码不会导出。
 
 ## 整库恢复
 
@@ -41,6 +41,4 @@ UUID 相同的事件只导入一次。通知历史不会重新发送，已触发
 
 - macOS/Windows 桌面通知权限；
 - SMTP 密码或授权码；
-- 微信 Webhook；
 - 14:50 系统调度任务。
-

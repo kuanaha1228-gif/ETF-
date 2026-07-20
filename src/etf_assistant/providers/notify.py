@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import json
 import os
 import platform
 import smtplib
 import ssl
 import subprocess
-import urllib.request
 from dataclasses import dataclass
 from email.message import EmailMessage
 from typing import Protocol
@@ -100,28 +98,6 @@ class SmtpEmailNotifier:
                 client.starttls(context=context)
                 client.login(self.username, self.password)
                 client.send_message(message)
-
-
-@dataclass(slots=True)
-class WeComWebhookNotifier:
-    webhook_url: str
-    name: str = "wechat"
-
-    def send(self, title: str, body: str) -> None:
-        payload = json.dumps(
-            {"msgtype": "text", "text": {"content": f"{title}\n\n{body}"}},
-            ensure_ascii=False,
-        ).encode("utf-8")
-        request = urllib.request.Request(
-            self.webhook_url,
-            data=payload,
-            headers={"Content-Type": "application/json; charset=utf-8"},
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=15) as response:
-            result = json.loads(response.read().decode("utf-8"))
-        if result.get("errcode") not in (None, 0):
-            raise RuntimeError(f"WeChat webhook rejected the message: {result.get('errmsg', 'unknown error')}")
 
 
 @dataclass(slots=True)

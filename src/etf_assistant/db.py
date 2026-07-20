@@ -21,7 +21,7 @@ from .domain import (
 )
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SENSITIVE_SETTING_MARKERS = ("password", "secret", "token", "webhook", "authorization")
 
 
@@ -133,6 +133,16 @@ CREATE TABLE IF NOT EXISTS check_runs (
     created_events INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS market_snapshots (
+    plan_id TEXT PRIMARY KEY REFERENCES plans(id) ON DELETE CASCADE,
+    quote_price TEXT NOT NULL,
+    quote_time TEXT NOT NULL,
+    daily_change TEXT,
+    highest_close TEXT,
+    drawdown TEXT,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
@@ -209,6 +219,21 @@ class Database:
             if current == 0:
                 connection.executescript(SCHEMA_SQL)
                 connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            elif current == 1:
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS market_snapshots (
+                        plan_id TEXT PRIMARY KEY REFERENCES plans(id) ON DELETE CASCADE,
+                        quote_price TEXT NOT NULL,
+                        quote_time TEXT NOT NULL,
+                        daily_change TEXT,
+                        highest_close TEXT,
+                        drawdown TEXT,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                connection.execute("PRAGMA user_version = 2")
 
     def integrity_check(self) -> bool:
         with self.read() as connection:
@@ -334,6 +359,48 @@ class Database:
                 (limit,),
             ).fetchall()
 
+    def save_market_snapshot(
+        self,
+        *,
+        plan_id: UUID,
+        quote_price: Decimal,
+        quote_time: datetime,
+        daily_change: Decimal | None,
+        highest_close: Decimal | None,
+        drawdown: Decimal | None,
+    ) -> None:
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO market_snapshots (
+                    plan_id, quote_price, quote_time, daily_change,
+                    highest_close, drawdown, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(plan_id) DO UPDATE SET
+                    quote_price = excluded.quote_price,
+                    quote_time = excluded.quote_time,
+                    daily_change = excluded.daily_change,
+                    highest_close = excluded.highest_close,
+                    drawdown = excluded.drawdown,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    str(plan_id),
+                    str(quote_price),
+                    quote_time.isoformat(),
+                    str(daily_change) if daily_change is not None else None,
+                    str(highest_close) if highest_close is not None else None,
+                    str(drawdown) if drawdown is not None else None,
+                    utc_now_text(),
+                ),
+            )
+
+    def market_snapshots(self) -> list[sqlite3.Row]:
+        with self.read() as connection:
+            return connection.execute(
+                "SELECT * FROM market_snapshots ORDER BY updated_at DESC"
+            ).fetchall()
+
     def get_active_strategy(self, plan_id: UUID) -> Strategy:
         with self.read() as connection:
             row = connection.execute(
@@ -355,7 +422,7 @@ class Database:
     def count_rows(self) -> dict[str, int]:
         tables = (
             "plans", "strategy_versions", "strategy_levels", "drawdown_cycles",
-            "events", "notification_deliveries", "check_runs", "settings",
+            "events", "notification_deliveries", "check_runs", "market_snapshots", "settings",
             "message_templates", "audit_log",
         )
         with self.read() as connection:
@@ -367,7 +434,7 @@ class Database:
     def set_setting(self, key: str, value: str) -> None:
         lowered = key.lower()
         if any(marker in lowered for marker in SENSITIVE_SETTING_MARKERS):
-            raise ValueError("sensitive values must be stored in the operating-system credential store")
+            raise ValueError("sensitive values must be stored outside the SQLite database")
         with self.transaction() as connection:
             connection.execute(
                 """

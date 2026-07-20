@@ -12,7 +12,7 @@ from .config import default_database_path
 from .db import Database
 from .domain import EffectiveMode, ExecutionMode, Plan, Strategy, StrategyLevel
 from .strategy import default_strategy
-from .providers.credentials import KeyringCredentialStore
+from .providers.credentials import LocalCredentialStore
 from .runtime import run_daily_check
 from .scheduler import install_scheduler, remove_scheduler
 
@@ -72,8 +72,8 @@ def build_parser() -> argparse.ArgumentParser:
     merge.add_argument("--conflict", choices=("local", "import"), default="local")
     check = commands.add_parser("daily-check", help="run the market check once")
     check.add_argument("--force", action="store_true", help="allow a manual check outside 14:45-15:00")
-    secret = commands.add_parser("set-secret", help="save a secret in the operating-system credential store")
-    secret.add_argument("key", choices=("smtp.password", "wechat.webhook"))
+    secret = commands.add_parser("set-secret", help="save a secret in the local app data file")
+    secret.add_argument("key", choices=("smtp.password",))
     secret.add_argument("value", nargs="?", help="omit to enter without echoing or shell history")
     commands.add_parser("install-scheduler", help="install the 14:50 operating-system task")
     commands.add_parser("remove-scheduler", help="remove the operating-system task")
@@ -134,8 +134,8 @@ def main(argv: list[str] | None = None) -> int:
         }, ensure_ascii=False, indent=2))
     elif args.command == "set-secret":
         value = args.value or getpass.getpass(f"Enter {args.key}: ")
-        KeyringCredentialStore().set(args.key, value)
-        print(f"saved {args.key} in the system credential store")
+        LocalCredentialStore().set(args.key, value)
+        print(f"saved {args.key} in the local app data file")
     elif args.command == "install-scheduler":
         if getattr(sys, "frozen", False):
             command = [sys.executable, "--db", str(database.path), "daily-check"]

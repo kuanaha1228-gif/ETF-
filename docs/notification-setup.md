@@ -16,7 +16,7 @@
 - `smtp.recipient`
 - `smtp.use_ssl`
 
-密码使用交互式命令写入系统凭证库：
+可直接在桌面应用“系统设置”中填写并发送测试邮件。授权码会写入系统凭证库，也可使用交互式命令配置：
 
 ```bash
 etf-assistant set-secret smtp.password
@@ -24,17 +24,6 @@ etf-assistant set-secret smtp.password
 
 不要把密码作为命令行参数传递，以免进入 shell 历史。
 
-## 微信
-
-V1 支持企业微信机器人兼容 Webhook。系统不模拟登录个人微信，也不保存微信密码。
-
-```bash
-etf-assistant set-secret wechat.webhook
-```
-
-启用 `notification.wechat.enabled=true` 后，先执行测试消息再启用14:50任务。
-
 ## 送达规则
 
-任一渠道发送成功，事件状态变为 `NOTIFIED` 并占用本周提醒次数。用户不需要回复邮件或微信；实际执行状态保持 `UNKNOWN`，但不影响后续判断。
-
+任一渠道发送成功，事件状态变为 `NOTIFIED` 并占用本周提醒次数。用户不需要回复邮件；实际执行状态保持 `UNKNOWN`，但不影响后续判断。

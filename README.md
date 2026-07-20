@@ -12,7 +12,7 @@
 - 最近 20 个已完成交易日最高收盘价回撤计算；
 - 同日幂等、同周提醒限制和通知送达闭环；
 - SQLite 本地存储；
-- macOS 桌面通知、Windows Toast、SMTP 邮件、企业微信 Webhook 适配器；
+- macOS 桌面通知、Windows Toast 和可配置的 SMTP 邮件；
 - `.etfbak` 完整导出、校验、恢复和幂等合并；
 - macOS `launchd` 与 Windows 任务计划定义；
 - AKShare 行情适配器和可替换接口；
@@ -86,7 +86,7 @@ etf-assistant add-plan \
 ## 安全边界
 
 - 不连接支付宝或券商交易账户；
-- 不保存邮箱密码和微信 Webhook 到 SQLite 或迁移包；
+- 不保存邮箱密码或授权码到 SQLite 或迁移包；
 - 密钥进入 macOS Keychain 或 Windows Credential Manager；
 - 场内 ETF 行情只用于规则计算，不代表场外基金最终净值；
 - 不保证收益，不构成投资建议。

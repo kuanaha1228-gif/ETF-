@@ -99,6 +99,14 @@ class DailyCheckService:
                     raise RuntimeError("latest quote is unavailable")
                 if abs((now - quote.quoted_at).total_seconds()) > 600:
                     raise RuntimeError("latest quote is older than 10 minutes")
+                self.database.save_market_snapshot(
+                    plan_id=plan.id,
+                    quote_price=quote.price,
+                    quote_time=quote.quoted_at,
+                    daily_change=quote.daily_change,
+                    highest_close=None,
+                    drawdown=None,
+                )
                 strategy = self.database.get_active_strategy(plan.id)
                 closes = self.market.completed_closes(plan.signal_code, 20)
                 decision = evaluate(
@@ -106,6 +114,14 @@ class DailyCheckService:
                     completed_closes=closes,
                     base_amount=plan.base_amount,
                     strategy=strategy,
+                )
+                self.database.save_market_snapshot(
+                    plan_id=plan.id,
+                    quote_price=quote.price,
+                    quote_time=quote.quoted_at,
+                    daily_change=quote.daily_change,
+                    highest_close=decision.highest_close,
+                    drawdown=decision.drawdown,
                 )
                 self.database.update_recovery(plan.id, decision.drawdown <= Decimal("2"))
                 regular = plan.base_amount if plan.recurring_enabled and today.weekday() == plan.invest_weekday else Decimal("0.00")

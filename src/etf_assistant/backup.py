@@ -74,7 +74,7 @@ def export_backup(database: Database, destination: str | Path) -> Path:
         )
         (temp / "README.txt").write_text(
             "ETF Plan Assistant migration package. Credentials are intentionally excluded.\n"
-            "Reconfigure SMTP and WeChat credentials after import.\n",
+            "Reconfigure the SMTP credential after import.\n",
             encoding="utf-8",
         )
         manifest = {
@@ -204,7 +204,8 @@ def restore_backup(backup_path: str | Path, target: Database) -> Path | None:
 
 MERGE_TABLES = (
     "plans", "strategy_versions", "strategy_levels", "drawdown_cycles", "events",
-    "notification_deliveries", "check_runs", "settings", "message_templates", "audit_log",
+    "notification_deliveries", "check_runs", "market_snapshots", "settings",
+    "message_templates", "audit_log",
 )
 
 

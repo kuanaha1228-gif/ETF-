@@ -48,6 +48,9 @@ class DailyCheckTests(TestCase):
         self.assertEqual(row["execution_status"], "unknown")
         self.assertEqual(row["extra_amount"], "450.00")
         self.assertEqual(len(messages), 1)
+        snapshot = self.database.market_snapshots()[0]
+        self.assertEqual(snapshot["quote_price"], "85")
+        self.assertEqual(snapshot["highest_close"], "100")
 
     def test_repeated_run_does_not_send_duplicate_message(self) -> None:
         messages: list[tuple[str, str]] = []
@@ -62,23 +65,36 @@ class DailyCheckTests(TestCase):
         row = self.database.event_row(result.created_events[0])
         self.assertEqual(row["state"], "delivery_failed")
 
+    def test_latest_quote_is_saved_when_history_request_fails(self) -> None:
+        market = StaticMarketProvider(
+            quotes={"513180": Quote("513180", Decimal("86"), self.now, Decimal("1.2"))},
+            closes={},
+        )
+        result = DailyCheckService(
+            self.database, market, WeekdayCalendar(), [RecordingNotifier("email", [])]
+        ).run(self.now)
+        self.assertEqual(len(result.errors), 1)
+        snapshot = self.database.market_snapshots()[0]
+        self.assertEqual(snapshot["quote_price"], "86")
+        self.assertIsNone(snapshot["drawdown"])
+
     def test_only_failed_channel_is_retried(self) -> None:
         email_messages: list[tuple[str, str]] = []
-        wechat_messages: list[tuple[str, str]] = []
+        desktop_messages: list[tuple[str, str]] = []
         service = self._service(RecordingNotifier("email", email_messages))
-        service.notifiers.append(RecordingNotifier("wechat", wechat_messages, should_fail=True))
+        service.notifiers.append(RecordingNotifier("desktop", desktop_messages, should_fail=True))
         result = service.run(self.now)
         event_id = result.created_events[0]
         self.assertEqual(self.database.event_row(event_id)["state"], "notified")
 
         service.notifiers = [
             RecordingNotifier("email", email_messages),
-            RecordingNotifier("wechat", wechat_messages),
+            RecordingNotifier("desktop", desktop_messages),
         ]
         service.run(self.now)
         self.assertEqual(len(email_messages), 1)
-        self.assertEqual(len(wechat_messages), 1)
-        self.assertEqual(self.database.delivery_states(event_id)["wechat"].value, "sent")
+        self.assertEqual(len(desktop_messages), 1)
+        self.assertEqual(self.database.delivery_states(event_id)["desktop"].value, "sent")
 
     def test_immediate_strategy_does_not_replay_same_threshold(self) -> None:
         first = self._service(RecordingNotifier("email", [])).run(self.now)
