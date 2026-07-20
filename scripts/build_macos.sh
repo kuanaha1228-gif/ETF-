@@ -8,7 +8,7 @@ python -m PyInstaller \
   --name "ETF Plan Assistant" \
   --collect-all akshare \
   --collect-all keyring \
-  src/etf_assistant/gui.py
+  src/etf_assistant/gui_entry.py
 rm -rf dist/dmg-root
 mkdir -p dist/dmg-root
 cp -R "dist/ETF Plan Assistant.app" dist/dmg-root/
