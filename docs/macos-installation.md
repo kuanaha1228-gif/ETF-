@@ -31,5 +31,11 @@ cat ~/Library/LaunchAgents/com.etfplanassistant.daily-check.plist
 etf-assistant remove-scheduler
 ```
 
-正式 DMG 的安装、公证和 Gatekeeper 截图将在 UI 接入并完成原生构建后补充。
+## 构建 DMG
 
+```bash
+bash scripts/build_macos.sh
+```
+
+输出文件为 `dist/ETFPlanAssistant-Core.dmg`，其中包含标准的 `ETF Plan Assistant.app`。
+当前构建未进行 Apple Developer ID 签名或公证，首次打开时可能需要在“系统设置 → 隐私与安全性”中确认。

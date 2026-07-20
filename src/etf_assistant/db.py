@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
@@ -569,10 +570,18 @@ class Database:
             row = connection.execute(
                 """
                 SELECT 1 FROM events
-                WHERE plan_id = ? AND week_key = ? AND state = ? AND extra_amount != '0.00'
+                WHERE plan_id = ? AND week_key = ?
+                  AND state IN (?, ?, ?)
+                  AND CAST(extra_amount AS NUMERIC) > 0
                 LIMIT 1
                 """,
-                (str(plan_id), week_key, EventState.NOTIFIED.value),
+                (
+                    str(plan_id),
+                    week_key,
+                    EventState.NOTIFIED.value,
+                    EventState.IGNORED.value,
+                    EventState.POSTPONED.value,
+                ),
             ).fetchone()
             return row is not None
 
@@ -581,10 +590,16 @@ class Database:
             return connection.execute(
                 """
                 SELECT * FROM events
-                WHERE cycle_id = ? AND level_id = ? AND state = ?
+                WHERE cycle_id = ? AND level_id = ? AND state IN (?, ?, ?)
                 ORDER BY trading_date, created_at
                 """,
-                (str(cycle_id), str(level_id), EventState.NOTIFIED.value),
+                (
+                    str(cycle_id),
+                    str(level_id),
+                    EventState.NOTIFIED.value,
+                    EventState.IGNORED.value,
+                    EventState.POSTPONED.value,
+                ),
             ).fetchall()
 
     def notified_threshold_events(
@@ -595,10 +610,16 @@ class Database:
             return connection.execute(
                 """
                 SELECT * FROM events
-                WHERE cycle_id = ? AND threshold_snapshot = ? AND state = ?
+                WHERE cycle_id = ? AND threshold_snapshot = ? AND state IN (?, ?, ?)
                 ORDER BY trading_date, created_at
                 """,
-                (str(cycle_id), str(threshold), EventState.NOTIFIED.value),
+                (
+                    str(cycle_id),
+                    str(threshold),
+                    EventState.NOTIFIED.value,
+                    EventState.IGNORED.value,
+                    EventState.POSTPONED.value,
+                ),
             ).fetchall()
 
     def highest_notified_threshold(self, cycle_id: UUID) -> Decimal | None:
@@ -606,9 +627,15 @@ class Database:
             rows = connection.execute(
                 """
                 SELECT threshold_snapshot FROM events
-                WHERE cycle_id = ? AND state = ? AND threshold_snapshot IS NOT NULL
+                WHERE cycle_id = ? AND state IN (?, ?, ?)
+                  AND threshold_snapshot IS NOT NULL
                 """,
-                (str(cycle_id), EventState.NOTIFIED.value),
+                (
+                    str(cycle_id),
+                    EventState.NOTIFIED.value,
+                    EventState.IGNORED.value,
+                    EventState.POSTPONED.value,
+                ),
             ).fetchall()
         values = [Decimal(row["threshold_snapshot"]) for row in rows]
         return max(values) if values else None
@@ -642,3 +669,84 @@ class Database:
                     "UPDATE events SET state = ?, updated_at = ? WHERE id = ?",
                     (EventState.DELIVERY_FAILED.value, utc_now_text(), str(event_id)),
                 )
+
+    def update_event_action(
+        self,
+        event_id: UUID,
+        *,
+        state: EventState | None = None,
+        execution_status: ExecutionStatus | None = None,
+        executed_amount: Decimal | None = None,
+        executed_at: datetime | None = None,
+    ) -> None:
+        """Record a user action without changing the immutable event snapshot."""
+        if state is not None and state not in {
+            EventState.IGNORED,
+            EventState.POSTPONED,
+        }:
+            raise ValueError("user action state must be ignored or postponed")
+        if execution_status is None and state is None:
+            raise ValueError("an event action is required")
+        if executed_amount is not None and executed_amount < 0:
+            raise ValueError("executed_amount cannot be negative")
+        if execution_status is not ExecutionStatus.EXECUTED and executed_amount is not None:
+            raise ValueError("executed_amount is only valid for executed events")
+
+        now = utc_now_text()
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT state, execution_status FROM events WHERE id = ?",
+                (str(event_id),),
+            ).fetchone()
+            if row is None:
+                raise KeyError("event not found")
+            next_state = state.value if state is not None else row["state"]
+            next_execution = (
+                execution_status.value
+                if execution_status is not None
+                else row["execution_status"]
+            )
+            execution_time = (
+                (executed_at or datetime.now().astimezone()).isoformat(timespec="seconds")
+                if execution_status is ExecutionStatus.EXECUTED
+                else None
+            )
+            connection.execute(
+                """
+                UPDATE events
+                SET state = ?, execution_status = ?, executed_amount = ?,
+                    executed_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    next_state,
+                    next_execution,
+                    str(executed_amount) if executed_amount is not None else None,
+                    execution_time,
+                    now,
+                    str(event_id),
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO audit_log (id, action, entity_type, entity_id, details_json, created_at)
+                VALUES (?, ?, 'event', ?, ?, ?)
+                """,
+                (
+                    str(uuid4()),
+                    "event_user_action",
+                    str(event_id),
+                    json.dumps(
+                        {
+                            "state": next_state,
+                            "execution_status": next_execution,
+                            "executed_amount": (
+                                str(executed_amount) if executed_amount is not None else None
+                            ),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    now,
+                ),
+            )

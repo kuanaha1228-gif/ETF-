@@ -9,7 +9,15 @@ from uuid import UUID, uuid4
 from .backup import export_backup, restore_backup
 from .config import default_database_path
 from .db import Database
-from .domain import EffectiveMode, ExecutionMode, Plan, Strategy, StrategyLevel
+from .domain import (
+    EffectiveMode,
+    EventState,
+    ExecutionMode,
+    ExecutionStatus,
+    Plan,
+    Strategy,
+    StrategyLevel,
+)
 from .strategy import default_strategy
 
 
@@ -294,6 +302,25 @@ def main() -> int:
 
         def _history_page(self):
             page, layout = self._page("提醒历史", "记录当时使用的行情、策略版本和通知结果，不依赖你回填成交")
+            actions = QtWidgets.QHBoxLayout()
+            executed = QtWidgets.QPushButton("记录为已执行")
+            not_executed = QtWidgets.QPushButton("记录为未执行")
+            ignored = QtWidgets.QPushButton("忽略本档")
+            postponed = QtWidgets.QPushButton("延迟提醒")
+            executed.clicked.connect(self._mark_executed)
+            not_executed.clicked.connect(
+                lambda: self._update_selected_event(execution_status=ExecutionStatus.NOT_EXECUTED)
+            )
+            ignored.clicked.connect(
+                lambda: self._update_selected_event(state=EventState.IGNORED)
+            )
+            postponed.clicked.connect(
+                lambda: self._update_selected_event(state=EventState.POSTPONED)
+            )
+            for button in (executed, not_executed, ignored, postponed):
+                actions.addWidget(button)
+            actions.addStretch()
+            layout.addLayout(actions)
             self.history_table = self._table(("时间", "计划", "回撤", "档位", "固定投入", "额外投入", "状态"))
             layout.addWidget(self.history_table, 1)
             return page
@@ -400,8 +427,50 @@ def main() -> int:
                     _money(event["regular_amount"]), _money(event["extra_amount"]), event["state"],
                 )
                 for column, value in enumerate(values):
-                    self.history_table.setItem(row, column, QtWidgets.QTableWidgetItem(str(value)))
+                    item = QtWidgets.QTableWidgetItem(str(value))
+                    item.setData(QtCore.Qt.ItemDataRole.UserRole, event["id"])
+                    self.history_table.setItem(row, column, item)
             self.history_table.resizeColumnsToContents()
+
+        def _selected_event_id(self) -> UUID | None:
+            row = self.history_table.currentRow()
+            if row < 0:
+                QtWidgets.QMessageBox.information(self, "请选择提醒", "请先在历史表格中选择一条提醒。")
+                return None
+            return UUID(self.history_table.item(row, 0).data(QtCore.Qt.ItemDataRole.UserRole))
+
+        def _update_selected_event(self, **changes) -> None:
+            event_id = self._selected_event_id()
+            if event_id is None:
+                return
+            try:
+                self.database.update_event_action(event_id, **changes)
+                self.refresh()
+            except (KeyError, ValueError) as error:
+                QtWidgets.QMessageBox.warning(self, "无法更新提醒", str(error))
+
+        def _mark_executed(self) -> None:
+            event_id = self._selected_event_id()
+            if event_id is None:
+                return
+            row = self.database.event_row(event_id)
+            planned = Decimal(row["total_amount"])
+            amount, accepted = QtWidgets.QInputDialog.getDouble(
+                self,
+                "记录实际投入",
+                "实际投入金额（可按实际情况修改）：",
+                float(planned),
+                0,
+                10_000_000,
+                2,
+            )
+            if accepted:
+                self.database.update_event_action(
+                    event_id,
+                    execution_status=ExecutionStatus.EXECUTED,
+                    executed_amount=Decimal(str(amount)),
+                )
+                self.refresh()
 
         def _fill_today(self, events) -> None:
             from datetime import date

@@ -24,5 +24,10 @@ schtasks /Query /TN "ETF Plan Assistant Daily Check" /V /FO LIST
 etf-assistant remove-scheduler
 ```
 
-正式 EXE 安装和 SmartScreen 说明将在 UI 接入并完成签名方案后补充。
+## 构建 EXE
 
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/build_windows.ps1
+```
+
+输出文件为 `dist\ETFPlanAssistant.exe`。当前构建未使用代码签名证书，Windows SmartScreen 可能在首次运行时显示未知发布者提示。
