@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "ETF Plan Assistant Contributors" }]
-dependencies = []
+dependencies = ["tzdata>=2025.2; platform_system == 'Windows'"]
 
 [project.optional-dependencies]
 market = ["akshare>=1.16"]
