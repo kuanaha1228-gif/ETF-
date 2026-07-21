@@ -51,6 +51,9 @@ class StrategyLevel:
     interval_weeks: int = 1
     enabled: bool = True
     amount_cap: Decimal | None = None
+    max_executions: int | None = None
+    cycle_amount_cap: Decimal | None = None
+    cycle_multiplier_cap: Decimal | None = None
     note: str = ""
     id: UUID = field(default_factory=uuid4)
 
@@ -70,6 +73,17 @@ class StrategyLevel:
             raise ValueError("non-phased levels must have exactly one phase")
         if self.amount_cap is not None and self.amount_cap <= 0:
             raise ValueError("amount_cap must be greater than 0")
+        if self.max_executions is not None and self.max_executions < 1:
+            raise ValueError("max_executions must be at least 1")
+        if self.cycle_amount_cap is not None and self.cycle_amount_cap <= 0:
+            raise ValueError("cycle_amount_cap must be greater than 0")
+        if self.cycle_multiplier_cap is not None and self.cycle_multiplier_cap <= 0:
+            raise ValueError("cycle_multiplier_cap must be greater than 0")
+        if self.execution_mode is ExecutionMode.WEEKLY_WHILE_DEEP:
+            if self.max_executions is None:
+                raise ValueError("continuous levels require max_executions")
+            if self.cycle_amount_cap is None and self.cycle_multiplier_cap is None:
+                raise ValueError("continuous levels require a cycle cap")
 
 
 @dataclass(frozen=True, slots=True)

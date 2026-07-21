@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Iterator
@@ -21,7 +21,7 @@ from .domain import (
 )
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 5
 SENSITIVE_SETTING_MARKERS = ("password", "secret", "token", "webhook", "authorization")
 
 
@@ -63,6 +63,9 @@ CREATE TABLE IF NOT EXISTS strategy_levels (
     interval_weeks INTEGER NOT NULL,
     enabled INTEGER NOT NULL,
     amount_cap TEXT,
+    max_executions INTEGER,
+    cycle_amount_cap TEXT,
+    cycle_multiplier_cap TEXT,
     note TEXT NOT NULL DEFAULT '',
     position INTEGER NOT NULL,
     UNIQUE(strategy_id, threshold)
@@ -75,6 +78,10 @@ CREATE TABLE IF NOT EXISTS drawdown_cycles (
     started_at TEXT NOT NULL,
     ended_at TEXT,
     recovery_checks INTEGER NOT NULL DEFAULT 0,
+    recovery_last_trading_date TEXT,
+    cycle_peak TEXT,
+    budget_started_at TEXT,
+    paused_for_review INTEGER NOT NULL DEFAULT 0,
     state TEXT NOT NULL DEFAULT 'active'
 );
 
@@ -140,6 +147,8 @@ CREATE TABLE IF NOT EXISTS market_snapshots (
     daily_change TEXT,
     highest_close TEXT,
     drawdown TEXT,
+    cycle_peak TEXT,
+    cycle_drawdown TEXT,
     updated_at TEXT NOT NULL
 );
 
@@ -219,21 +228,101 @@ class Database:
             if current == 0:
                 connection.executescript(SCHEMA_SQL)
                 connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-            elif current == 1:
-                connection.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS market_snapshots (
-                        plan_id TEXT PRIMARY KEY REFERENCES plans(id) ON DELETE CASCADE,
-                        quote_price TEXT NOT NULL,
-                        quote_time TEXT NOT NULL,
-                        daily_change TEXT,
-                        highest_close TEXT,
-                        drawdown TEXT,
-                        updated_at TEXT NOT NULL
+            else:
+                if current < 2:
+                    connection.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS market_snapshots (
+                            plan_id TEXT PRIMARY KEY REFERENCES plans(id) ON DELETE CASCADE,
+                            quote_price TEXT NOT NULL,
+                            quote_time TEXT NOT NULL,
+                            daily_change TEXT,
+                            highest_close TEXT,
+                            drawdown TEXT,
+                            updated_at TEXT NOT NULL
+                        )
+                        """
                     )
-                    """
-                )
-                connection.execute("PRAGMA user_version = 2")
+                    connection.execute("PRAGMA user_version = 2")
+                if current < 3:
+                    columns = {
+                        row["name"]
+                        for row in connection.execute("PRAGMA table_info(drawdown_cycles)")
+                    }
+                    if "recovery_last_trading_date" not in columns:
+                        connection.execute(
+                            """
+                            ALTER TABLE drawdown_cycles
+                            ADD COLUMN recovery_last_trading_date TEXT
+                            """
+                        )
+                    connection.execute("PRAGMA user_version = 3")
+                if current < 4:
+                    cycle_columns = {
+                        row["name"]
+                        for row in connection.execute("PRAGMA table_info(drawdown_cycles)")
+                    }
+                    if "cycle_peak" not in cycle_columns:
+                        connection.execute(
+                            "ALTER TABLE drawdown_cycles ADD COLUMN cycle_peak TEXT"
+                        )
+                    snapshot_columns = {
+                        row["name"]
+                        for row in connection.execute("PRAGMA table_info(market_snapshots)")
+                    }
+                    if "cycle_peak" not in snapshot_columns:
+                        connection.execute(
+                            "ALTER TABLE market_snapshots ADD COLUMN cycle_peak TEXT"
+                        )
+                    if "cycle_drawdown" not in snapshot_columns:
+                        connection.execute(
+                            "ALTER TABLE market_snapshots ADD COLUMN cycle_drawdown TEXT"
+                        )
+                    connection.execute("PRAGMA user_version = 4")
+                if current < 5:
+                    level_columns = {
+                        row["name"]
+                        for row in connection.execute("PRAGMA table_info(strategy_levels)")
+                    }
+                    for column, definition in (
+                        ("max_executions", "INTEGER"),
+                        ("cycle_amount_cap", "TEXT"),
+                        ("cycle_multiplier_cap", "TEXT"),
+                    ):
+                        if column not in level_columns:
+                            connection.execute(
+                                f"ALTER TABLE strategy_levels ADD COLUMN {column} {definition}"
+                            )
+                    cycle_columns = {
+                        row["name"]
+                        for row in connection.execute("PRAGMA table_info(drawdown_cycles)")
+                    }
+                    if "budget_started_at" not in cycle_columns:
+                        connection.execute(
+                            "ALTER TABLE drawdown_cycles ADD COLUMN budget_started_at TEXT"
+                        )
+                    if "paused_for_review" not in cycle_columns:
+                        connection.execute(
+                            """
+                            ALTER TABLE drawdown_cycles
+                            ADD COLUMN paused_for_review INTEGER NOT NULL DEFAULT 0
+                            """
+                        )
+                    connection.execute(
+                        """
+                        UPDATE drawdown_cycles SET budget_started_at = started_at
+                        WHERE budget_started_at IS NULL
+                        """
+                    )
+                    connection.execute(
+                        """
+                        UPDATE strategy_levels
+                        SET max_executions = COALESCE(max_executions, 4),
+                            cycle_multiplier_cap = COALESCE(cycle_multiplier_cap, '4')
+                        WHERE execution_mode = 'weekly_while_deep'
+                        """
+                    )
+                    connection.execute("PRAGMA user_version = 5")
 
     def integrity_check(self) -> bool:
         with self.read() as connection:
@@ -279,13 +368,17 @@ class Database:
                 """
                 INSERT INTO strategy_levels (
                     id, strategy_id, threshold, multiplier, execution_mode, phases,
-                    interval_weeks, enabled, amount_cap, note, position
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    interval_weeks, enabled, amount_cap, max_executions,
+                    cycle_amount_cap, cycle_multiplier_cap, note, position
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(level.id), str(strategy.id), str(level.threshold), str(level.multiplier),
                     level.execution_mode.value, level.phases, level.interval_weeks,
                     int(level.enabled), str(level.amount_cap) if level.amount_cap else None,
+                    level.max_executions,
+                    str(level.cycle_amount_cap) if level.cycle_amount_cap else None,
+                    str(level.cycle_multiplier_cap) if level.cycle_multiplier_cap else None,
                     level.note, position,
                 ),
             )
@@ -368,20 +461,24 @@ class Database:
         daily_change: Decimal | None,
         highest_close: Decimal | None,
         drawdown: Decimal | None,
+        cycle_peak: Decimal | None = None,
+        cycle_drawdown: Decimal | None = None,
     ) -> None:
         with self.transaction() as connection:
             connection.execute(
                 """
                 INSERT INTO market_snapshots (
                     plan_id, quote_price, quote_time, daily_change,
-                    highest_close, drawdown, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    highest_close, drawdown, cycle_peak, cycle_drawdown, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(plan_id) DO UPDATE SET
                     quote_price = excluded.quote_price,
                     quote_time = excluded.quote_time,
                     daily_change = excluded.daily_change,
                     highest_close = excluded.highest_close,
                     drawdown = excluded.drawdown,
+                    cycle_peak = excluded.cycle_peak,
+                    cycle_drawdown = excluded.cycle_drawdown,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -391,6 +488,8 @@ class Database:
                     str(daily_change) if daily_change is not None else None,
                     str(highest_close) if highest_close is not None else None,
                     str(drawdown) if drawdown is not None else None,
+                    str(cycle_peak) if cycle_peak is not None else None,
+                    str(cycle_drawdown) if cycle_drawdown is not None else None,
                     utc_now_text(),
                 ),
             )
@@ -473,6 +572,15 @@ class Database:
                     phases=level["phases"], interval_weeks=level["interval_weeks"],
                     enabled=bool(level["enabled"]),
                     amount_cap=Decimal(level["amount_cap"]) if level["amount_cap"] else None,
+                    max_executions=level["max_executions"],
+                    cycle_amount_cap=(
+                        Decimal(level["cycle_amount_cap"])
+                        if level["cycle_amount_cap"] else None
+                    ),
+                    cycle_multiplier_cap=(
+                        Decimal(level["cycle_multiplier_cap"])
+                        if level["cycle_multiplier_cap"] else None
+                    ),
                     note=level["note"],
                 )
                 for level in levels
@@ -566,21 +674,34 @@ class Database:
                     (EventState.NOTIFIED.value, now, str(event_id)),
                 )
 
-    def get_or_create_active_cycle(self, plan_id: UUID, strategy_id: UUID) -> UUID:
+    def get_or_create_active_cycle(
+        self, plan_id: UUID, strategy_id: UUID, cycle_peak: Decimal | None = None
+    ) -> UUID:
         with self.transaction() as connection:
             row = connection.execute(
-                "SELECT id FROM drawdown_cycles WHERE plan_id = ? AND state = 'active'",
+                "SELECT * FROM drawdown_cycles WHERE plan_id = ? AND state = 'active'",
                 (str(plan_id),),
             ).fetchone()
             if row:
+                if row["cycle_peak"] is None and cycle_peak is not None:
+                    connection.execute(
+                        "UPDATE drawdown_cycles SET cycle_peak = ? WHERE id = ?",
+                        (str(cycle_peak), row["id"]),
+                    )
                 return UUID(row["id"])
             cycle_id = uuid4()
+            now = utc_now_text()
             connection.execute(
                 """
-                INSERT INTO drawdown_cycles (id, plan_id, strategy_id, started_at, state)
-                VALUES (?, ?, ?, ?, 'active')
+                INSERT INTO drawdown_cycles (
+                    id, plan_id, strategy_id, started_at, cycle_peak,
+                    budget_started_at, state
+                ) VALUES (?, ?, ?, ?, ?, ?, 'active')
                 """,
-                (str(cycle_id), str(plan_id), str(strategy_id), utc_now_text()),
+                (
+                    str(cycle_id), str(plan_id), str(strategy_id), now,
+                    str(cycle_peak) if cycle_peak is not None else None, now,
+                ),
             )
             return cycle_id
 
@@ -591,8 +712,99 @@ class Database:
                 (str(plan_id),),
             ).fetchone()
 
-    def update_recovery(self, plan_id: UUID, recovered: bool) -> bool:
-        """Return True when a cycle ends after two consecutive recovery checks."""
+    def resolve_cycle_peak(self, plan_id: UUID, fallback: Decimal) -> Decimal:
+        """Return the immutable peak, recovering legacy cycles from event snapshots."""
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM drawdown_cycles WHERE plan_id = ? AND state = 'active'",
+                (str(plan_id),),
+            ).fetchone()
+            if row is None:
+                raise KeyError("active cycle not found")
+            if row["cycle_peak"] is not None:
+                return Decimal(row["cycle_peak"])
+            values = connection.execute(
+                "SELECT highest_close FROM events WHERE cycle_id = ?",
+                (row["id"],),
+            ).fetchall()
+            peak = max(
+                (Decimal(value["highest_close"]) for value in values),
+                default=fallback,
+            )
+            connection.execute(
+                "UPDATE drawdown_cycles SET cycle_peak = ? WHERE id = ?",
+                (str(peak), row["id"]),
+            )
+            return peak
+
+    def cycle_budget_usage(self, cycle_id: UUID) -> tuple[int, Decimal, Decimal]:
+        with self.read() as connection:
+            cycle = connection.execute(
+                "SELECT budget_started_at, started_at FROM drawdown_cycles WHERE id = ?",
+                (str(cycle_id),),
+            ).fetchone()
+            if cycle is None:
+                raise KeyError("cycle not found")
+            rows = connection.execute(
+                """
+                SELECT extra_amount, multiplier_snapshot FROM events
+                WHERE cycle_id = ? AND execution_mode_snapshot = 'weekly_while_deep'
+                  AND created_at >= COALESCE(?, ?)
+                  AND state IN (?, ?, ?)
+                """,
+                (
+                    str(cycle_id), cycle["budget_started_at"], cycle["started_at"],
+                    EventState.NOTIFIED.value,
+                    EventState.IGNORED.value, EventState.POSTPONED.value,
+                ),
+            ).fetchall()
+        return (
+            len(rows),
+            sum((Decimal(row["extra_amount"]) for row in rows), Decimal("0")),
+            sum(
+                (Decimal(row["multiplier_snapshot"]) for row in rows),
+                Decimal("0"),
+            ),
+        )
+
+    def set_cycle_paused(self, cycle_id: UUID, paused: bool) -> None:
+        with self.transaction() as connection:
+            if paused:
+                connection.execute(
+                    "UPDATE drawdown_cycles SET paused_for_review = 1 WHERE id = ?",
+                    (str(cycle_id),),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE drawdown_cycles
+                    SET paused_for_review = 0, budget_started_at = ?
+                    WHERE id = ? AND state = 'active'
+                    """,
+                    (
+                        datetime.now().astimezone().isoformat(timespec="microseconds"),
+                        str(cycle_id),
+                    ),
+                )
+
+    def resume_cycle(self, plan_id: UUID) -> None:
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE drawdown_cycles
+                SET paused_for_review = 0, budget_started_at = ?
+                WHERE plan_id = ? AND state = 'active' AND paused_for_review = 1
+                """,
+                (
+                    datetime.now().astimezone().isoformat(timespec="microseconds"),
+                    str(plan_id),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("该基金当前没有等待确认的补仓周期")
+
+    def update_recovery(self, plan_id: UUID, recovered: bool, trading_date: date) -> bool:
+        """End a cycle after recovery checks on two distinct trading dates."""
         with self.transaction() as connection:
             row = connection.execute(
                 "SELECT * FROM drawdown_cycles WHERE plan_id = ? AND state = 'active'",
@@ -600,21 +812,39 @@ class Database:
             ).fetchone()
             if row is None:
                 return False
-            checks = row["recovery_checks"] + 1 if recovered else 0
+            value = trading_date.isoformat()
+            if not recovered:
+                connection.execute(
+                    """
+                    UPDATE drawdown_cycles
+                    SET recovery_checks = 0, recovery_last_trading_date = NULL
+                    WHERE id = ?
+                    """,
+                    (row["id"],),
+                )
+                return False
+            if row["recovery_last_trading_date"] == value:
+                return False
+            checks = row["recovery_checks"] + 1
             if checks < 2:
                 connection.execute(
-                    "UPDATE drawdown_cycles SET recovery_checks = ? WHERE id = ?",
-                    (checks, row["id"]),
+                    """
+                    UPDATE drawdown_cycles
+                    SET recovery_checks = ?, recovery_last_trading_date = ?
+                    WHERE id = ?
+                    """,
+                    (checks, value, row["id"]),
                 )
                 return False
             now = utc_now_text()
             connection.execute(
                 """
                 UPDATE drawdown_cycles
-                SET state = 'ended', ended_at = ?, recovery_checks = ?
+                SET state = 'ended', ended_at = ?, recovery_checks = ?,
+                    recovery_last_trading_date = ?
                 WHERE id = ?
                 """,
-                (now, checks, row["id"]),
+                (now, checks, value, row["id"]),
             )
             plan = connection.execute(
                 "SELECT pending_strategy_id FROM plans WHERE id = ?", (str(plan_id),)

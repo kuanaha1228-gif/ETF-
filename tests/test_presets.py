@@ -26,15 +26,15 @@ class PresetTests(TestCase):
                     ("014415", "516670", Decimal("300")),
                 ],
             )
+            expected = {
+                "159361": ("4", "7", "10", "15", "22"),
+                "159516": ("6", "11", "17", "25", "35"),
+                "516080": ("6", "11", "17", "25", "35"),
+                "516670": ("6", "11", "17", "25", "35"),
+            }
             for plan in plans:
                 strategy = database.get_active_strategy(plan.id)
                 self.assertEqual(
-                    [(level.threshold, level.multiplier) for level in strategy.levels],
-                    [
-                        (Decimal("5"), Decimal("1")),
-                        (Decimal("8"), Decimal("1")),
-                        (Decimal("10"), Decimal("2")),
-                        (Decimal("15"), Decimal("1")),
-                        (Decimal("20"), Decimal("1")),
-                    ],
+                    tuple(str(level.threshold) for level in strategy.levels),
+                    expected[plan.signal_code],
                 )

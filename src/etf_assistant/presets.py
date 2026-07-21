@@ -5,7 +5,7 @@ from decimal import Decimal
 
 from .db import Database
 from .domain import Plan
-from .strategy import default_strategy
+from .strategy import strategy_from_template
 
 
 @dataclass(frozen=True, slots=True)
@@ -15,13 +15,14 @@ class PlanPreset:
     signal_name: str
     signal_code: str
     base_amount: Decimal
+    strategy_template: str
 
 
 PRD_PLAN_PRESETS = (
-    PlanPreset("易方达中证 A500ETF 联接 A", "022459", "A500ETF 易方达", "159361", Decimal("600")),
-    PlanPreset("国泰半导体材料设备 ETF 联接 A", "019632", "半导体设备 ETF 国泰", "159516", Decimal("250")),
-    PlanPreset("易方达创新药 ETF 联接 A", "019666", "创新药 ETF 易方达", "516080", Decimal("200")),
-    PlanPreset("招商畜牧养殖 ETF 联接 C", "014415", "畜牧养殖 ETF 招商", "516670", Decimal("300")),
+    PlanPreset("易方达中证 A500ETF 联接 A", "022459", "A500ETF 易方达", "159361", Decimal("600"), "core"),
+    PlanPreset("国泰半导体材料设备 ETF 联接 A", "019632", "半导体设备 ETF 国泰", "159516", Decimal("250"), "sector"),
+    PlanPreset("易方达创新药 ETF 联接 A", "019666", "创新药 ETF 易方达", "516080", Decimal("200"), "sector"),
+    PlanPreset("招商畜牧养殖 ETF 联接 C", "014415", "畜牧养殖 ETF 招商", "516670", Decimal("300"), "sector"),
 )
 
 
@@ -43,7 +44,9 @@ def install_prd_plan_presets(database: Database) -> int:
             signal_name=preset.signal_name,
             base_amount=preset.base_amount,
         )
-        database.add_plan_with_strategy(plan, default_strategy(plan.id))
+        database.add_plan_with_strategy(
+            plan, strategy_from_template(plan.id, preset.strategy_template)
+        )
         installed += 1
     database.set_setting("system.prd_plan_presets_installed", "true")
     return installed

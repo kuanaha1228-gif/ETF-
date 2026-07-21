@@ -9,28 +9,44 @@ from .domain import ExecutionMode, Strategy, StrategyLevel, TriggerDecision
 MONEY_QUANT = Decimal("0.01")
 
 
-def default_strategy(plan_id: UUID, version: int = 1) -> Strategy:
+STRATEGY_TEMPLATES = {
+    "stable": ("稳健 / 低波", ("3", "5", "8", "12", "18")),
+    "core": ("核心宽基", ("4", "7", "10", "15", "22")),
+    "growth": ("高波宽基", ("5", "9", "14", "20", "28")),
+    "sector": ("行业主题", ("6", "11", "17", "25", "35")),
+}
+
+
+def strategy_from_template(plan_id: UUID, template: str, version: int = 1) -> Strategy:
+    try:
+        _, thresholds = STRATEGY_TEMPLATES[template]
+    except KeyError as error:
+        raise ValueError("unknown strategy template") from error
     return Strategy(
         plan_id=plan_id,
         version=version,
-        levels=(
-            StrategyLevel(Decimal("5"), Decimal("1")),
-            StrategyLevel(Decimal("8"), Decimal("1")),
-            StrategyLevel(Decimal("10"), Decimal("2")),
+        levels=tuple(
             StrategyLevel(
-                Decimal("15"),
-                Decimal("1"),
-                execution_mode=ExecutionMode.PHASED,
-                phases=2,
-                interval_weeks=1,
-            ),
-            StrategyLevel(
-                Decimal("20"),
-                Decimal("1"),
-                execution_mode=ExecutionMode.WEEKLY_WHILE_DEEP,
-            ),
+                Decimal(threshold),
+                Decimal("2") if position == 2 else Decimal("1"),
+                execution_mode=(
+                    ExecutionMode.PHASED
+                    if position == 3
+                    else ExecutionMode.WEEKLY_WHILE_DEEP
+                    if position == 4
+                    else ExecutionMode.ONCE
+                ),
+                phases=2 if position == 3 else 1,
+                max_executions=4 if position == 4 else None,
+                cycle_multiplier_cap=Decimal("4") if position == 4 else None,
+            )
+            for position, threshold in enumerate(thresholds)
         ),
     )
+
+
+def default_strategy(plan_id: UUID, version: int = 1) -> Strategy:
+    return strategy_from_template(plan_id, "core", version)
 
 
 def calculate_drawdown(current_price: Decimal, completed_closes: list[Decimal]) -> tuple[Decimal, Decimal]:

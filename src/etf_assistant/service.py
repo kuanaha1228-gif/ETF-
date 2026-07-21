@@ -48,6 +48,43 @@ def _phase_is_due(database: Database, cycle_id: UUID, level: StrategyLevel, toda
     return (today - last_date).days >= level.interval_weeks * 7
 
 
+def _continuous_budget_allows(
+    database: Database,
+    cycle_id: UUID,
+    level: StrategyLevel,
+    next_amount: Decimal,
+) -> bool:
+    if level.execution_mode is not ExecutionMode.WEEKLY_WHILE_DEEP:
+        return True
+    count, amount, multiplier = database.cycle_budget_usage(cycle_id)
+    if level.max_executions is not None and count >= level.max_executions:
+        return False
+    if level.cycle_amount_cap is not None and amount + next_amount > level.cycle_amount_cap:
+        return False
+    if (
+        level.cycle_multiplier_cap is not None
+        and multiplier + level.multiplier > level.cycle_multiplier_cap
+    ):
+        return False
+    return True
+
+
+def _continuous_budget_exhausted(
+    database: Database, cycle_id: UUID, level: StrategyLevel
+) -> bool:
+    if level.execution_mode is not ExecutionMode.WEEKLY_WHILE_DEEP:
+        return False
+    count, amount, multiplier = database.cycle_budget_usage(cycle_id)
+    return bool(
+        (level.max_executions is not None and count >= level.max_executions)
+        or (level.cycle_amount_cap is not None and amount >= level.cycle_amount_cap)
+        or (
+            level.cycle_multiplier_cap is not None
+            and multiplier >= level.cycle_multiplier_cap
+        )
+    )
+
+
 def _render(plan: Plan, quote: Quote, drawdown: Decimal, highest: Decimal, level: StrategyLevel | None, regular: Decimal, extra: Decimal) -> tuple[str, str]:
     if level is None:
         title = f"【ETF定投提醒】{plan.name}"
@@ -61,7 +98,7 @@ def _render(plan: Plan, quote: Quote, drawdown: Decimal, highest: Decimal, level
         f"购买基金：{plan.purchase_name or plan.name}（{plan.purchase_code}）\n"
         f"观察 ETF：{plan.signal_name or plan.signal_code}（{plan.signal_code}）\n"
         f"最新价：{quote.price}，行情时间：{quote.quoted_at:%Y-%m-%d %H:%M:%S}\n"
-        f"20日最高收盘价：{highest}，当前回撤：{drawdown:.2f}%\n"
+        f"本轮固定回撤高点：{highest}，本轮回撤：{drawdown:.2f}%\n"
         f"固定定投：{regular} 元\n"
         f"额外投入：{plan.base_amount} × {level.multiplier} = {extra} 元\n"
         f"今日计划合计：{regular + extra} 元\n\n"
@@ -109,47 +146,90 @@ class DailyCheckService:
                 )
                 strategy = self.database.get_active_strategy(plan.id)
                 closes = self.market.completed_closes(plan.signal_code, 20)
-                decision = evaluate(
+                short_decision = evaluate(
                     current_price=quote.price,
                     completed_closes=closes,
                     base_amount=plan.base_amount,
                     strategy=strategy,
                 )
+                active_cycle = self.database.get_active_cycle(plan.id)
+                cycle_id = UUID(active_cycle["id"]) if active_cycle else None
+                cycle_peak = None
+                cycle_drawdown = None
+                paused_for_review = bool(active_cycle["paused_for_review"]) if active_cycle else False
+                if active_cycle:
+                    cycle_peak = self.database.resolve_cycle_peak(
+                        plan.id, short_decision.highest_close
+                    )
+                    decision = evaluate(
+                        current_price=quote.price,
+                        completed_closes=[cycle_peak],
+                        base_amount=plan.base_amount,
+                        strategy=strategy,
+                    )
+                    cycle_drawdown = decision.drawdown
+                else:
+                    decision = short_decision
+                    if plan.drawdown_enabled and decision.level is not None:
+                        cycle_peak = short_decision.highest_close
+                        cycle_drawdown = short_decision.drawdown
+                        cycle_id = self.database.get_or_create_active_cycle(
+                            plan.id, strategy.id, cycle_peak
+                        )
+                if active_cycle and cycle_drawdown is not None:
+                    ended = self.database.update_recovery(
+                        plan.id, cycle_drawdown <= Decimal("2"), today
+                    )
+                    if ended:
+                        cycle_id = None
+                        cycle_peak = None
+                        cycle_drawdown = None
                 self.database.save_market_snapshot(
                     plan_id=plan.id,
                     quote_price=quote.price,
                     quote_time=quote.quoted_at,
                     daily_change=quote.daily_change,
-                    highest_close=decision.highest_close,
-                    drawdown=decision.drawdown,
+                    highest_close=short_decision.highest_close,
+                    drawdown=short_decision.drawdown,
+                    cycle_peak=cycle_peak,
+                    cycle_drawdown=cycle_drawdown,
                 )
-                self.database.update_recovery(plan.id, decision.drawdown <= Decimal("2"))
                 regular = plan.base_amount if plan.recurring_enabled and today.weekday() == plan.invest_weekday else Decimal("0.00")
-                level = decision.level if plan.drawdown_enabled else None
+                level = (
+                    decision.level
+                    if plan.drawdown_enabled and not paused_for_review
+                    else None
+                )
                 extra = Decimal("0.00")
-                cycle_id: UUID | None = None
                 state = EventState.CREATED
                 event_type = "recurring"
                 if level is not None:
-                    cycle_id = self.database.get_or_create_active_cycle(plan.id, strategy.id)
-                    week_key = iso_week_key(today)
-                    highest_notified = self.database.highest_notified_threshold(cycle_id)
-                    shallow_replay = (
-                        highest_notified is not None
-                        and level.threshold < highest_notified
-                        and level.execution_mode is not ExecutionMode.WEEKLY_WHILE_DEEP
-                    )
-                    due = not shallow_replay and _phase_is_due(
-                        self.database, cycle_id, level, today
-                    )
-                    if self.database.notified_this_week(plan.id, week_key):
-                        state = EventState.SUPPRESSED
-                        event_type = "level_suppressed"
-                    elif due:
-                        extra = decision.extra_amount
-                        event_type = "combined" if regular else "drawdown"
-                    else:
+                    if cycle_id is None:
+                        raise RuntimeError("drawdown cycle was not initialized")
+                    if not _continuous_budget_allows(
+                        self.database, cycle_id, level, decision.extra_amount
+                    ):
+                        self.database.set_cycle_paused(cycle_id, True)
                         level = None
+                    else:
+                        week_key = iso_week_key(today)
+                        highest_notified = self.database.highest_notified_threshold(cycle_id)
+                        shallow_replay = (
+                            highest_notified is not None
+                            and level.threshold < highest_notified
+                            and level.execution_mode is not ExecutionMode.WEEKLY_WHILE_DEEP
+                        )
+                        due = not shallow_replay and _phase_is_due(
+                            self.database, cycle_id, level, today
+                        )
+                        if self.database.notified_this_week(plan.id, week_key):
+                            state = EventState.SUPPRESSED
+                            event_type = "level_suppressed"
+                        elif due:
+                            extra = decision.extra_amount
+                            event_type = "combined" if regular else "drawdown"
+                        else:
+                            level = None
                 if regular == 0 and extra == 0 and state is not EventState.SUPPRESSED:
                     continue
                 week_key = iso_week_key(today)
@@ -210,6 +290,10 @@ class DailyCheckService:
                         )
                 if not sent:
                     self.database.mark_event_delivery_failed(event_id)
+                elif level is not None and cycle_id is not None and _continuous_budget_exhausted(
+                    self.database, cycle_id, level
+                ):
+                    self.database.set_cycle_paused(cycle_id, True)
             except Exception as error:
                 errors.append(f"{plan.signal_code}: {error}")
         return CheckResult(len(plans), tuple(created), tuple(errors))

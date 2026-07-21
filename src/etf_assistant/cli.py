@@ -32,6 +32,18 @@ def _strategy_from_json(plan: Plan, path: Path) -> Strategy:
             interval_weeks=int(item.get("interval_weeks", 1)),
             enabled=bool(item.get("enabled", True)),
             amount_cap=Decimal(str(item["amount_cap"])) if item.get("amount_cap") else None,
+            max_executions=(
+                int(item.get("max_executions", 4))
+                if item.get("execution_mode") == "weekly_while_deep" else None
+            ),
+            cycle_amount_cap=(
+                Decimal(str(item["cycle_amount_cap"]))
+                if item.get("cycle_amount_cap") else None
+            ),
+            cycle_multiplier_cap=(
+                Decimal(str(item.get("cycle_multiplier_cap", 4)))
+                if item.get("execution_mode") == "weekly_while_deep" else None
+            ),
             note=str(item.get("note", "")),
         )
         for item in payload["levels"]

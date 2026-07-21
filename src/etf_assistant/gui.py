@@ -14,7 +14,7 @@ from .domain import EffectiveMode, EventState, ExecutionMode, ExecutionStatus, P
 from .presets import install_prd_plan_presets
 from .providers.credentials import LocalCredentialStore
 from .providers.notify import SmtpEmailNotifier
-from .strategy import default_strategy
+from .strategy import STRATEGY_TEMPLATES, default_strategy
 
 
 WEEKDAYS = ("周一", "周二", "周三", "周四", "周五")
@@ -54,6 +54,7 @@ def _friendly_error(error: Exception) -> str:
 
 def _plan_payload(database: Database, plan: Plan) -> dict[str, object]:
     strategy = database.get_active_strategy(plan.id)
+    cycle = database.get_active_cycle(plan.id)
     return {
         "id": str(plan.id),
         "name": plan.name,
@@ -67,12 +68,22 @@ def _plan_payload(database: Database, plan: Plan) -> dict[str, object]:
         "recurringEnabled": plan.recurring_enabled,
         "drawdownEnabled": plan.drawdown_enabled,
         "enabled": plan.enabled,
+        "pausedForReview": bool(cycle["paused_for_review"]) if cycle else False,
+        "cyclePeak": cycle["cycle_peak"] if cycle else None,
         "levels": [
             {
                 "threshold": str(level.threshold),
                 "multiplier": str(level.multiplier),
                 "executionMode": level.execution_mode.value,
                 "enabled": level.enabled,
+                "maxExecutions": level.max_executions,
+                "cycleAmountCap": (
+                    str(level.cycle_amount_cap) if level.cycle_amount_cap else None
+                ),
+                "cycleMultiplierCap": (
+                    str(level.cycle_multiplier_cap)
+                    if level.cycle_multiplier_cap else None
+                ),
             }
             for level in strategy.levels
         ],
@@ -106,6 +117,8 @@ def main() -> int:
                     "dailyChange": row["daily_change"],
                     "highestClose": row["highest_close"],
                     "drawdown": row["drawdown"],
+                    "cyclePeak": row["cycle_peak"],
+                    "cycleDrawdown": row["cycle_drawdown"],
                     "updatedAt": row["updated_at"],
                 }
                 for row in database.market_snapshots()
@@ -129,6 +142,10 @@ def main() -> int:
                         }
                         for row in events
                     ],
+                    "strategyTemplates": {
+                        key: {"name": value[0], "thresholds": value[1]}
+                        for key, value in STRATEGY_TEMPLATES.items()
+                    },
                     "settings": {
                         "desktopEnabled": database.get_setting("notification.desktop.enabled", "true") == "true",
                         "emailEnabled": database.get_setting("notification.email.enabled", "false") == "true",
@@ -168,6 +185,18 @@ def main() -> int:
                         execution_mode=ExecutionMode(item.get("executionMode", "once")),
                         phases=2 if item.get("executionMode") == "phased" else 1,
                         enabled=bool(item.get("enabled", True)),
+                        max_executions=(
+                            int(item["maxExecutions"])
+                            if item.get("maxExecutions") else None
+                        ),
+                        cycle_amount_cap=(
+                            Decimal(str(item["cycleAmountCap"]))
+                            if item.get("cycleAmountCap") else None
+                        ),
+                        cycle_multiplier_cap=(
+                            Decimal(str(item["cycleMultiplierCap"]))
+                            if item.get("cycleMultiplierCap") else None
+                        ),
                     )
                     for item in payload.get("levels", [])
                 )
@@ -176,10 +205,18 @@ def main() -> int:
                     current = database.get_active_strategy(existing.id)
                     database.update_plan(plan)
                     if levels and tuple(
-                        (level.threshold, level.multiplier, level.execution_mode, level.enabled)
+                        (
+                            level.threshold, level.multiplier, level.execution_mode,
+                            level.enabled, level.max_executions, level.cycle_amount_cap,
+                            level.cycle_multiplier_cap,
+                        )
                         for level in levels
                     ) != tuple(
-                        (level.threshold, level.multiplier, level.execution_mode, level.enabled)
+                        (
+                            level.threshold, level.multiplier, level.execution_mode,
+                            level.enabled, level.max_executions, level.cycle_amount_cap,
+                            level.cycle_multiplier_cap,
+                        )
                         for level in current.levels
                     ):
                         database.save_strategy(
@@ -212,6 +249,15 @@ def main() -> int:
                         enabled=current.enabled,
                     )
                 )
+                self.stateChanged.emit()
+                return ""
+            except Exception as error:
+                return str(error)
+
+        @QtCore.Slot(str, result=str)
+        def resumeCycle(self, plan_id: str) -> str:
+            try:
+                database.resume_cycle(UUID(plan_id))
                 self.stateChanged.emit()
                 return ""
             except Exception as error:

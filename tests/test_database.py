@@ -1,5 +1,5 @@
 import tempfile
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 from unittest import TestCase
@@ -59,6 +59,16 @@ class DatabaseTests(TestCase):
             connection.execute("PRAGMA user_version = 1")
         self.database.initialize()
         self.assertIn("market_snapshots", self.database.count_rows())
+        with self.database.read() as connection:
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(drawdown_cycles)")
+            }
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+        self.assertIn("recovery_last_trading_date", columns)
+        self.assertIn("cycle_peak", columns)
+        self.assertIn("paused_for_review", columns)
+        self.assertEqual(version, 5)
 
     def test_next_cycle_strategy_activates_after_recovery(self) -> None:
         plan = Plan("A500", "022459", "159361", Decimal("600"))
@@ -72,9 +82,21 @@ class DatabaseTests(TestCase):
         )
         self.database.save_strategy(pending)
         self.database.get_or_create_active_cycle(plan.id, initial.id)
-        self.assertFalse(self.database.update_recovery(plan.id, True))
-        self.assertTrue(self.database.update_recovery(plan.id, True))
+        self.assertFalse(self.database.update_recovery(plan.id, True, date(2026, 7, 20)))
+        self.assertFalse(self.database.update_recovery(plan.id, True, date(2026, 7, 20)))
+        self.assertTrue(self.database.update_recovery(plan.id, True, date(2026, 7, 21)))
         self.assertEqual(self.database.get_active_strategy(plan.id).id, pending.id)
+
+    def test_failed_recovery_check_restarts_distinct_day_count(self) -> None:
+        plan = Plan("A500", "022459", "159361", Decimal("600"))
+        strategy = default_strategy(plan.id)
+        self.database.add_plan_with_strategy(plan, strategy)
+        self.database.get_or_create_active_cycle(plan.id, strategy.id)
+
+        self.assertFalse(self.database.update_recovery(plan.id, True, date(2026, 7, 20)))
+        self.assertFalse(self.database.update_recovery(plan.id, False, date(2026, 7, 21)))
+        self.assertFalse(self.database.update_recovery(plan.id, True, date(2026, 7, 22)))
+        self.assertTrue(self.database.update_recovery(plan.id, True, date(2026, 7, 23)))
 
     def test_sensitive_setting_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
@@ -175,4 +197,40 @@ class DatabaseTests(TestCase):
         )
         self.database.update_event_action(event_id, state=EventState.IGNORED)
         self.assertTrue(self.database.notified_this_week(plan.id, "2026-W30"))
-        self.assertEqual(self.database.highest_notified_threshold(cycle_id), Decimal("5"))
+        self.assertEqual(
+            self.database.highest_notified_threshold(cycle_id), level.threshold
+        )
+
+    def test_cycle_peak_is_fixed_and_legacy_peak_uses_highest_event_snapshot(self) -> None:
+        plan = Plan("A500", "022459", "159361", Decimal("600"))
+        strategy = default_strategy(plan.id)
+        self.database.add_plan_with_strategy(plan, strategy)
+        cycle_id = self.database.get_or_create_active_cycle(plan.id, strategy.id)
+        for index, peak in enumerate((Decimal("1.00"), Decimal("0.90"))):
+            self.database.create_event(
+                plan_id=plan.id,
+                strategy_id=strategy.id,
+                level_id=strategy.levels[0].id,
+                event_type="drawdown",
+                trading_date=f"2026-07-{20 + index}",
+                week_key="2026-W30",
+                quote_price=Decimal("0.80"),
+                quote_time=strategy.created_at,
+                daily_change=None,
+                highest_close=peak,
+                drawdown=Decimal("20"),
+                threshold_snapshot=strategy.levels[0].threshold,
+                multiplier_snapshot=Decimal("1"),
+                execution_mode_snapshot="once",
+                regular_amount=Decimal("0"),
+                extra_amount=Decimal("600"),
+                idempotency_key=f"legacy-peak-{index}",
+                cycle_id=cycle_id,
+            )
+        self.assertEqual(
+            self.database.resolve_cycle_peak(plan.id, Decimal("0.85")), Decimal("1.00")
+        )
+        self.assertEqual(
+            Decimal(self.database.get_active_cycle(plan.id)["cycle_peak"]),
+            Decimal("1.00"),
+        )

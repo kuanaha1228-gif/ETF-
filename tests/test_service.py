@@ -1,11 +1,18 @@
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from unittest import TestCase
 
 from etf_assistant.db import Database
-from etf_assistant.domain import EffectiveMode, Plan, Quote, Strategy, StrategyLevel
+from etf_assistant.domain import (
+    EffectiveMode,
+    ExecutionMode,
+    Plan,
+    Quote,
+    Strategy,
+    StrategyLevel,
+)
 from etf_assistant.providers.market import StaticMarketProvider, WeekdayCalendar
 from etf_assistant.providers.notify import RecordingNotifier
 from etf_assistant.service import DailyCheckService
@@ -121,3 +128,89 @@ class DailyCheckTests(TestCase):
         row = self.database.event_row(result.created_events[0])
         self.assertEqual(row["event_type"], "recurring")
         self.assertEqual(row["extra_amount"], "0.00")
+
+    def test_active_cycle_uses_fixed_peak_when_rolling_high_moves_down(self) -> None:
+        self._service(RecordingNotifier("email", [])).run(self.now)
+        next_week = self.now + timedelta(days=7)
+        market = StaticMarketProvider(
+            quotes={"513180": Quote("513180", Decimal("82"), next_week)},
+            closes={"513180": [Decimal("90")] * 20},
+        )
+        DailyCheckService(
+            self.database, market, WeekdayCalendar(), [RecordingNotifier("email", [])]
+        ).run(next_week)
+
+        snapshot = self.database.market_snapshots()[0]
+        self.assertEqual(Decimal(snapshot["highest_close"]), Decimal("90"))
+        self.assertAlmostEqual(float(snapshot["drawdown"]), 8.888888, places=5)
+        self.assertEqual(Decimal(snapshot["cycle_peak"]), Decimal("100"))
+        self.assertEqual(Decimal(snapshot["cycle_drawdown"]), Decimal("18.00"))
+
+    def test_continuous_level_pauses_after_four_weeks_until_user_resumes(self) -> None:
+        self.database.update_plan(
+            Plan(
+                id=self.plan.id,
+                name=self.plan.name,
+                purchase_code=self.plan.purchase_code,
+                signal_code=self.plan.signal_code,
+                base_amount=self.plan.base_amount,
+                invest_weekday=self.plan.invest_weekday,
+                recurring_enabled=False,
+            )
+        )
+        limited = Strategy(
+            plan_id=self.plan.id,
+            version=2,
+            effective_mode=EffectiveMode.IMMEDIATE,
+            levels=(
+                StrategyLevel(
+                    Decimal("20"),
+                    Decimal("1"),
+                    execution_mode=ExecutionMode.WEEKLY_WHILE_DEEP,
+                    max_executions=4,
+                    cycle_multiplier_cap=Decimal("4"),
+                ),
+            ),
+        )
+        self.database.save_strategy(limited)
+        messages: list[tuple[str, str]] = []
+
+        for week in range(4):
+            now = self.now + timedelta(days=week * 7)
+            market = StaticMarketProvider(
+                quotes={"513180": Quote("513180", Decimal("75"), now)},
+                closes={"513180": [Decimal("100")] * 20},
+            )
+            DailyCheckService(
+                self.database, market, WeekdayCalendar(),
+                [RecordingNotifier("email", messages)],
+            ).run(now)
+
+        cycle = self.database.get_active_cycle(self.plan.id)
+        self.assertTrue(cycle["paused_for_review"])
+        self.assertEqual(len(messages), 4)
+
+        blocked_date = self.now + timedelta(days=28)
+        blocked_market = StaticMarketProvider(
+            quotes={"513180": Quote("513180", Decimal("70"), blocked_date)},
+            closes={"513180": [Decimal("100")] * 20},
+        )
+        blocked = DailyCheckService(
+            self.database, blocked_market, WeekdayCalendar(),
+            [RecordingNotifier("email", messages)],
+        ).run(blocked_date)
+        self.assertEqual(len(blocked.created_events), 0)
+        self.assertEqual(len(messages), 4)
+
+        self.database.resume_cycle(self.plan.id)
+        resumed_date = self.now + timedelta(days=35)
+        resumed_market = StaticMarketProvider(
+            quotes={"513180": Quote("513180", Decimal("70"), resumed_date)},
+            closes={"513180": [Decimal("100")] * 20},
+        )
+        resumed = DailyCheckService(
+            self.database, resumed_market, WeekdayCalendar(),
+            [RecordingNotifier("email", messages)],
+        ).run(resumed_date)
+        self.assertEqual(len(resumed.created_events), 1)
+        self.assertEqual(len(messages), 5)

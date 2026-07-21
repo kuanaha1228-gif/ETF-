@@ -3,7 +3,14 @@ from unittest import TestCase
 from uuid import uuid4
 
 from etf_assistant.domain import ExecutionMode, Strategy, StrategyLevel
-from etf_assistant.strategy import calculate_drawdown, choose_level, default_strategy, evaluate
+from etf_assistant.strategy import (
+    STRATEGY_TEMPLATES,
+    calculate_drawdown,
+    choose_level,
+    default_strategy,
+    evaluate,
+    strategy_from_template,
+)
 
 
 class StrategyTests(TestCase):
@@ -12,15 +19,32 @@ class StrategyTests(TestCase):
         self.assertEqual(
             [(level.threshold, level.multiplier) for level in strategy.levels],
             [
-                (Decimal("5"), Decimal("1")),
-                (Decimal("8"), Decimal("1")),
+                (Decimal("4"), Decimal("1")),
+                (Decimal("7"), Decimal("1")),
                 (Decimal("10"), Decimal("2")),
                 (Decimal("15"), Decimal("1")),
-                (Decimal("20"), Decimal("1")),
+                (Decimal("22"), Decimal("1")),
             ],
         )
         self.assertEqual(strategy.levels[3].execution_mode, ExecutionMode.PHASED)
         self.assertEqual(strategy.levels[4].execution_mode, ExecutionMode.WEEKLY_WHILE_DEEP)
+        self.assertEqual(strategy.levels[4].max_executions, 4)
+        self.assertEqual(strategy.levels[4].cycle_multiplier_cap, Decimal("4"))
+
+    def test_all_initialization_templates_match_product_rules(self) -> None:
+        expected = {
+            "stable": ("3", "5", "8", "12", "18"),
+            "core": ("4", "7", "10", "15", "22"),
+            "growth": ("5", "9", "14", "20", "28"),
+            "sector": ("6", "11", "17", "25", "35"),
+        }
+        self.assertEqual(set(STRATEGY_TEMPLATES), set(expected))
+        for name, thresholds in expected.items():
+            strategy = strategy_from_template(uuid4(), name)
+            self.assertEqual(
+                tuple(str(level.threshold) for level in strategy.levels), thresholds
+            )
+            self.assertEqual(strategy.levels[-1].max_executions, 4)
 
     def test_drawdown_uses_unrounded_value(self) -> None:
         drawdown, highest = calculate_drawdown(Decimal("95.004"), [Decimal("100")])
@@ -61,4 +85,3 @@ class StrategyTests(TestCase):
         )
         with self.assertRaises(ValueError):
             strategy.validate()
-
