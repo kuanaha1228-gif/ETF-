@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import platform
 import sys
 import threading
 from decimal import Decimal
@@ -14,6 +15,7 @@ from .domain import EffectiveMode, EventState, ExecutionMode, ExecutionStatus, P
 from .presets import install_prd_plan_presets
 from .providers.credentials import LocalCredentialStore
 from .providers.notify import SmtpEmailNotifier
+from .scheduler import ensure_scheduler
 from .strategy import STRATEGY_TEMPLATES, default_strategy
 
 
@@ -50,6 +52,15 @@ def _friendly_error(error: Exception) -> str:
     if any(marker in text.lower() for marker in ("connection", "timeout", "remote")):
         return "行情服务暂时不可用，请稍后再试"
     return "操作失败，请稍后再试"
+
+
+def _database_path_from_arguments(arguments: list[str]) -> Path:
+    if "--db" not in arguments:
+        return default_database_path()
+    index = arguments.index("--db")
+    if index + 1 >= len(arguments):
+        raise ValueError("--db requires a database path")
+    return Path(arguments[index + 1]).expanduser()
 
 
 def _plan_payload(database: Database, plan: Plan) -> dict[str, object]:
@@ -91,10 +102,29 @@ def _plan_payload(database: Database, plan: Plan) -> dict[str, object]:
 
 
 def main() -> int:
-    QtCore, QtWebChannel, QtWebEngineWidgets, QtWidgets = _load_qt()
-    database = Database(default_database_path())
+    database = Database(_database_path_from_arguments(sys.argv[1:]))
     database.initialize()
     install_prd_plan_presets(database)
+    if "--daily-check" in sys.argv:
+        from .runtime import run_daily_check
+
+        try:
+            result = run_daily_check(database, force="--force" in sys.argv)
+            return 0 if not result.errors else 1
+        except Exception:
+            # The database already contains a non-sensitive failure summary.
+            return 1
+
+    scheduler_ready = False
+    scheduler_error = ""
+    if getattr(sys, "frozen", False) and platform.system() == "Darwin":
+        try:
+            ensure_scheduler([sys.executable, "--daily-check"])
+            scheduler_ready = True
+        except Exception as error:
+            scheduler_error = str(error)
+
+    QtCore, QtWebChannel, QtWebEngineWidgets, QtWidgets = _load_qt()
 
     class Bridge(QtCore.QObject):
         stateChanged = QtCore.Signal()
@@ -110,6 +140,7 @@ def main() -> int:
         def getState(self) -> str:
             plans = database.list_plans()
             events = database.recent_events(100)
+            latest_check = database.latest_check_run()
             market = {
                 row["plan_id"]: {
                     "price": row["quote_price"],
@@ -139,9 +170,28 @@ def main() -> int:
                             "extraAmount": str(row["extra_amount"]),
                             "totalAmount": str(row["total_amount"]),
                             "state": row["state"],
+                            "executionStatus": row["execution_status"],
+                            "executedAmount": row["executed_amount"],
+                            "executedAt": row["executed_at"],
                         }
                         for row in events
                     ],
+                    "runtime": {
+                        "schedulerInstalled": scheduler_ready,
+                        "schedulerError": scheduler_error,
+                        "lastCheck": (
+                            {
+                                "startedAt": latest_check["started_at"],
+                                "finishedAt": latest_check["finished_at"],
+                                "state": latest_check["state"],
+                                "checkedPlans": latest_check["checked_plans"],
+                                "createdEvents": latest_check["created_events"],
+                                "errorSummary": latest_check["error_summary"],
+                            }
+                            if latest_check
+                            else None
+                        ),
+                    },
                     "strategyTemplates": {
                         key: {"name": value[0], "thresholds": value[1]}
                         for key, value in STRATEGY_TEMPLATES.items()

@@ -4,7 +4,12 @@ import unittest
 from decimal import Decimal
 from pathlib import Path
 
-from etf_assistant.gui import _check_result_message, _money, _percent
+from etf_assistant.gui import (
+    _check_result_message,
+    _database_path_from_arguments,
+    _money,
+    _percent,
+)
 from etf_assistant.service import CheckResult
 
 
@@ -14,6 +19,12 @@ class GuiHelperTests(unittest.TestCase):
 
     def test_percent_format(self) -> None:
         self.assertEqual(_percent(Decimal("10.456")), "10.46%")
+
+    def test_background_entry_accepts_an_isolated_database(self) -> None:
+        self.assertEqual(
+            _database_path_from_arguments(["--db", "/tmp/etf-test.sqlite", "--daily-check"]),
+            Path("/tmp/etf-test.sqlite"),
+        )
 
     def test_frozen_entry_dispatches_child_processes_before_qt_import(self) -> None:
         module = __import__("etf_assistant.gui_entry", fromlist=["__file__"])
@@ -43,6 +54,11 @@ class GuiHelperTests(unittest.TestCase):
         self.assertIn("开盘　", html)
         self.assertIn("涨跌　", html)
         self.assertIn("checkFinished.connect", html)
+        self.assertIn("executionStatus", html)
+        self.assertIn("已标记为执行，状态已保存", html)
+        self.assertIn("本条为 0 元风险提示，无需执行", html)
+        self.assertIn("本周已有补仓提醒，本次仅提示风险加深", html)
+        self.assertIn("定时检查：14:50 已启用", html)
         self.assertIn("var(--rise)", html)
         self.assertIn("var(--fall)", html)
         self.assertIn("不会再弹出系统密码框", html)

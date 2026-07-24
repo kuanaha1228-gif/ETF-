@@ -4,7 +4,7 @@ from pathlib import Path
 from unittest import TestCase
 from zoneinfo import ZoneInfo
 
-from etf_assistant.runtime import ProcessLock, in_execution_window
+from etf_assistant.runtime import ProcessLock, in_execution_window, run_daily_check
 from etf_assistant.runtime import build_notifiers, notification_configuration_errors
 from etf_assistant.db import Database
 from etf_assistant.providers.credentials import LocalCredentialStore, MemoryCredentialStore
@@ -77,3 +77,13 @@ class RuntimeTests(TestCase):
             notifiers = build_notifiers(database, credentials)
             self.assertEqual(len(notifiers), 1)
             self.assertIsInstance(notifiers[0], SmtpEmailNotifier)
+
+    def test_failed_scheduled_check_is_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            database = Database(Path(temp) / "test.sqlite")
+            outside_window = datetime(2026, 7, 20, 16, 0, tzinfo=SHANGHAI)
+            with self.assertRaisesRegex(RuntimeError, "MISSED_EXECUTION_WINDOW"):
+                run_daily_check(database, now=outside_window)
+            row = database.latest_check_run()
+            self.assertEqual(row["state"], "failed")
+            self.assertIn("MISSED_EXECUTION_WINDOW", row["error_summary"])

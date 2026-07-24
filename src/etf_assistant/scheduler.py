@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import os
 import platform
 import plistlib
 import subprocess
@@ -12,6 +13,10 @@ from .config import app_data_dir, default_log_dir
 
 MAC_LABEL = "com.etfplanassistant.daily-check"
 WINDOWS_TASK_NAME = "ETF Plan Assistant Daily Check"
+
+
+def macos_target() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / f"{MAC_LABEL}.plist"
 
 
 def macos_plist(command: list[str]) -> bytes:
@@ -45,15 +50,46 @@ def windows_task_xml(command: list[str]) -> str:
 </Task>"""
 
 
+def scheduler_is_installed(command: list[str] | None = None) -> bool:
+    if platform.system() != "Darwin":
+        return False
+    target = macos_target()
+    if not target.exists():
+        return False
+    if command is not None and target.read_bytes() != macos_plist(command):
+        return False
+    domain = f"gui/{os.getuid()}"
+    status = subprocess.run(
+        ["launchctl", "print", f"{domain}/{MAC_LABEL}"],
+        check=False,
+        capture_output=True,
+    )
+    return status.returncode == 0
+
+
 def install_scheduler(command: list[str]) -> Path:
     system = platform.system()
     default_log_dir().mkdir(parents=True, exist_ok=True)
     if system == "Darwin":
-        target = Path.home() / "Library" / "LaunchAgents" / f"{MAC_LABEL}.plist"
+        target = macos_target()
         target.parent.mkdir(parents=True, exist_ok=True)
+        domain = f"gui/{os.getuid()}"
+        subprocess.run(
+            ["launchctl", "bootout", domain, str(target)],
+            check=False,
+            capture_output=True,
+        )
         target.write_bytes(macos_plist(command))
-        subprocess.run(["launchctl", "unload", str(target)], check=False, capture_output=True)
-        subprocess.run(["launchctl", "load", str(target)], check=True)
+        subprocess.run(
+            ["launchctl", "bootstrap", domain, str(target)],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["launchctl", "enable", f"{domain}/{MAC_LABEL}"],
+            check=True,
+            capture_output=True,
+        )
         return target
     if system == "Windows":
         xml = windows_task_xml(command)
@@ -71,15 +107,24 @@ def install_scheduler(command: list[str]) -> Path:
     raise RuntimeError(f"scheduler installation is unsupported on {system}")
 
 
+def ensure_scheduler(command: list[str]) -> Path:
+    if scheduler_is_installed(command):
+        return macos_target()
+    return install_scheduler(command)
+
+
 def remove_scheduler() -> None:
     system = platform.system()
     if system == "Darwin":
-        target = Path.home() / "Library" / "LaunchAgents" / f"{MAC_LABEL}.plist"
-        subprocess.run(["launchctl", "unload", str(target)], check=False)
+        target = macos_target()
+        subprocess.run(
+            ["launchctl", "bootout", f"gui/{os.getuid()}", str(target)],
+            check=False,
+            capture_output=True,
+        )
         target.unlink(missing_ok=True)
         return
     if system == "Windows":
         subprocess.run(["schtasks", "/Delete", "/TN", WINDOWS_TASK_NAME, "/F"], check=False)
         return
     raise RuntimeError(f"scheduler removal is unsupported on {system}")
-

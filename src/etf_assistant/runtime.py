@@ -130,16 +130,35 @@ def run_daily_check(
 ) -> CheckResult:
     database.initialize()
     now = (now or datetime.now(tz=SHANGHAI)).astimezone(SHANGHAI)
-    if not force and not in_execution_window(now):
-        raise RuntimeError("MISSED_EXECUTION_WINDOW: scheduled checks must run between 14:45 and 15:00")
-    lock_path = app_data_dir() / "run" / "daily_check.lock"
-    with ProcessLock(lock_path):
-        configuration_errors = notification_configuration_errors(database, credentials)
-        service = DailyCheckService(
-            database=database,
-            market=AkshareMarketProvider(),
-            calendar=AkshareTradingCalendar(),
-            notifiers=build_notifiers(database, credentials),
+    run_id = database.start_check_run(now)
+    try:
+        if not force and not in_execution_window(now):
+            raise RuntimeError(
+                "MISSED_EXECUTION_WINDOW: scheduled checks must run between 14:45 and 15:00"
+            )
+        lock_path = app_data_dir() / "run" / "daily_check.lock"
+        with ProcessLock(lock_path):
+            configuration_errors = notification_configuration_errors(database, credentials)
+            service = DailyCheckService(
+                database=database,
+                market=AkshareMarketProvider(),
+                calendar=AkshareTradingCalendar(),
+                notifiers=build_notifiers(database, credentials),
+            )
+            result = service.run(now)
+            result = replace(result, errors=result.errors + configuration_errors)
+        database.finish_check_run(
+            run_id,
+            state="partial" if result.errors else "succeeded",
+            checked_plans=result.checked_plans,
+            created_events=len(result.created_events),
+            error_summary="; ".join(result.errors)[:1000] or None,
         )
-        result = service.run(now)
-        return replace(result, errors=result.errors + configuration_errors)
+        return result
+    except Exception as error:
+        database.finish_check_run(
+            run_id,
+            state="failed",
+            error_summary=str(error)[:1000],
+        )
+        raise

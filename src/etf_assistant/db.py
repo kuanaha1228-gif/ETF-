@@ -548,6 +548,56 @@ class Database:
             row = connection.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
         return row["value"] if row else default
 
+    def start_check_run(self, started_at: datetime) -> UUID:
+        run_id = uuid4()
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO check_runs (
+                    id, started_at, trading_date, state, checked_plans, created_events
+                ) VALUES (?, ?, ?, 'running', 0, 0)
+                """,
+                (
+                    str(run_id),
+                    started_at.isoformat(timespec="seconds"),
+                    started_at.date().isoformat(),
+                ),
+            )
+        return run_id
+
+    def finish_check_run(
+        self,
+        run_id: UUID,
+        *,
+        state: str,
+        checked_plans: int = 0,
+        created_events: int = 0,
+        error_summary: str | None = None,
+    ) -> None:
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE check_runs
+                SET finished_at = ?, state = ?, error_summary = ?,
+                    checked_plans = ?, created_events = ?
+                WHERE id = ?
+                """,
+                (
+                    datetime.now().astimezone().isoformat(timespec="seconds"),
+                    state,
+                    error_summary,
+                    checked_plans,
+                    created_events,
+                    str(run_id),
+                ),
+            )
+
+    def latest_check_run(self) -> sqlite3.Row | None:
+        with self.read() as connection:
+            return connection.execute(
+                "SELECT * FROM check_runs ORDER BY started_at DESC LIMIT 1"
+            ).fetchone()
+
     @staticmethod
     def _row_to_plan(row: sqlite3.Row) -> Plan:
         return Plan(
@@ -670,8 +720,21 @@ class Database:
             )
             if state is DeliveryState.SENT:
                 connection.execute(
-                    "UPDATE events SET state = ?, updated_at = ? WHERE id = ?",
-                    (EventState.NOTIFIED.value, now, str(event_id)),
+                    """
+                    UPDATE events
+                    SET state = CASE
+                            WHEN state = ? THEN state
+                            ELSE ?
+                        END,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        EventState.SUPPRESSED.value,
+                        EventState.NOTIFIED.value,
+                        now,
+                        str(event_id),
+                    ),
                 )
 
     def get_or_create_active_cycle(
@@ -902,13 +965,23 @@ class Database:
     def notified_threshold_events(
         self, cycle_id: UUID, threshold: Decimal
     ) -> list[sqlite3.Row]:
-        """Return successful events by threshold across strategy versions."""
+        """Return delivered alerts by threshold across strategy versions."""
         with self.read() as connection:
             return connection.execute(
                 """
-                SELECT * FROM events
-                WHERE cycle_id = ? AND threshold_snapshot = ? AND state IN (?, ?, ?)
-                ORDER BY trading_date, created_at
+                SELECT e.* FROM events e
+                WHERE e.cycle_id = ? AND e.threshold_snapshot = ?
+                  AND (
+                    e.state IN (?, ?, ?)
+                    OR (
+                      e.state = ?
+                      AND EXISTS (
+                        SELECT 1 FROM notification_deliveries d
+                        WHERE d.event_id = e.id AND d.state = ?
+                      )
+                    )
+                  )
+                ORDER BY e.trading_date, e.created_at
                 """,
                 (
                     str(cycle_id),
@@ -916,6 +989,8 @@ class Database:
                     EventState.NOTIFIED.value,
                     EventState.IGNORED.value,
                     EventState.POSTPONED.value,
+                    EventState.SUPPRESSED.value,
+                    DeliveryState.SENT.value,
                 ),
             ).fetchall()
 
@@ -923,15 +998,26 @@ class Database:
         with self.read() as connection:
             rows = connection.execute(
                 """
-                SELECT threshold_snapshot FROM events
-                WHERE cycle_id = ? AND state IN (?, ?, ?)
-                  AND threshold_snapshot IS NOT NULL
+                SELECT e.threshold_snapshot FROM events e
+                WHERE e.cycle_id = ? AND e.threshold_snapshot IS NOT NULL
+                  AND (
+                    e.state IN (?, ?, ?)
+                    OR (
+                      e.state = ?
+                      AND EXISTS (
+                        SELECT 1 FROM notification_deliveries d
+                        WHERE d.event_id = e.id AND d.state = ?
+                      )
+                    )
+                  )
                 """,
                 (
                     str(cycle_id),
                     EventState.NOTIFIED.value,
                     EventState.IGNORED.value,
                     EventState.POSTPONED.value,
+                    EventState.SUPPRESSED.value,
+                    DeliveryState.SENT.value,
                 ),
             ).fetchall()
         values = [Decimal(row["threshold_snapshot"]) for row in rows]

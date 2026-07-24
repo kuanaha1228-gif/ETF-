@@ -85,7 +85,17 @@ def _continuous_budget_exhausted(
     )
 
 
-def _render(plan: Plan, quote: Quote, drawdown: Decimal, highest: Decimal, level: StrategyLevel | None, regular: Decimal, extra: Decimal) -> tuple[str, str]:
+def _render(
+    plan: Plan,
+    quote: Quote,
+    drawdown: Decimal,
+    highest: Decimal,
+    level: StrategyLevel | None,
+    regular: Decimal,
+    extra: Decimal,
+    *,
+    suppressed: bool = False,
+) -> tuple[str, str]:
     if level is None:
         title = f"【ETF定投提醒】{plan.name}"
         body = (
@@ -94,6 +104,19 @@ def _render(plan: Plan, quote: Quote, drawdown: Decimal, highest: Decimal, level
         )
         return title, body
     title = f"【ETF计划提醒】{plan.name}触发{level.threshold}%档"
+    if suppressed:
+        return (
+            f"【ETF风险升级】{plan.name}触发{level.threshold}%档",
+            (
+                f"购买基金：{plan.purchase_name or plan.name}（{plan.purchase_code}）\n"
+                f"观察 ETF：{plan.signal_name or plan.signal_code}（{plan.signal_code}）\n"
+                f"最新价：{quote.price}，行情时间：{quote.quoted_at:%Y-%m-%d %H:%M:%S}\n"
+                f"本轮固定回撤高点：{highest}，本轮回撤：{drawdown:.2f}%\n\n"
+                "本周已经发送过一次补仓计划，本次仅提示风险档位加深，"
+                "不重复增加补仓金额。\n\n"
+                "本消息按你预设的规则计算，不代表最终收盘价格，也不构成投资建议。"
+            ),
+        )
     body = (
         f"购买基金：{plan.purchase_name or plan.name}（{plan.purchase_code}）\n"
         f"观察 ETF：{plan.signal_name or plan.signal_code}（{plan.signal_code}）\n"
@@ -261,8 +284,6 @@ class DailyCheckService:
                     state = EventState(existing["state"])
                     regular = Decimal(existing["regular_amount"])
                     extra = Decimal(existing["extra_amount"])
-                if state is EventState.SUPPRESSED:
-                    continue
                 deliveries = self.database.delivery_states(event_id)
                 pending_notifiers = [
                     notifier for notifier in self.notifiers
@@ -271,7 +292,14 @@ class DailyCheckService:
                 if not pending_notifiers:
                     continue
                 title, body = _render(
-                    plan, quote, decision.drawdown, decision.highest_close, level, regular, extra
+                    plan,
+                    quote,
+                    decision.drawdown,
+                    decision.highest_close,
+                    level,
+                    regular,
+                    extra,
+                    suppressed=state is EventState.SUPPRESSED,
                 )
                 sent = False
                 for notifier in pending_notifiers:

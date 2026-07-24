@@ -67,6 +67,66 @@ class DailyCheckTests(TestCase):
         self.assertEqual(len(messages), 1)
         self.assertEqual(self.database.count_rows()["events"], 1)
 
+    def test_deeper_level_same_week_sends_risk_alert_without_duplicate_investment(self) -> None:
+        self.database.update_plan(
+            Plan(
+                id=self.plan.id,
+                name=self.plan.name,
+                purchase_code=self.plan.purchase_code,
+                signal_code=self.plan.signal_code,
+                base_amount=self.plan.base_amount,
+                invest_weekday=self.plan.invest_weekday,
+                recurring_enabled=False,
+            )
+        )
+        self.database.save_strategy(
+            Strategy(
+                plan_id=self.plan.id,
+                version=2,
+                effective_mode=EffectiveMode.IMMEDIATE,
+                levels=(
+                    StrategyLevel(Decimal("12"), Decimal("1")),
+                    StrategyLevel(Decimal("15"), Decimal("2")),
+                ),
+            )
+        )
+        messages: list[tuple[str, str]] = []
+        first_market = StaticMarketProvider(
+            quotes={"513180": Quote("513180", Decimal("87"), self.now)},
+            closes={"513180": [Decimal("100")] * 20},
+        )
+        first = DailyCheckService(
+            self.database,
+            first_market,
+            WeekdayCalendar(),
+            [RecordingNotifier("email", messages)],
+        ).run(self.now)
+        self.assertEqual(
+            self.database.event_row(first.created_events[0])["extra_amount"],
+            "300.00",
+        )
+
+        next_day = self.now + timedelta(days=1)
+        deeper_market = StaticMarketProvider(
+            quotes={"513180": Quote("513180", Decimal("84"), next_day)},
+            closes={"513180": [Decimal("100")] * 20},
+        )
+        service = DailyCheckService(
+            self.database,
+            deeper_market,
+            WeekdayCalendar(),
+            [RecordingNotifier("email", messages)],
+        )
+        deeper = service.run(next_day)
+        row = self.database.event_row(deeper.created_events[0])
+        self.assertEqual(row["state"], "suppressed")
+        self.assertEqual(row["extra_amount"], "0.00")
+        self.assertIn("本周已经发送过一次补仓计划", messages[-1][1])
+        self.assertEqual(len(messages), 2)
+
+        service.run(next_day)
+        self.assertEqual(len(messages), 2)
+
     def test_all_delivery_failures_do_not_mark_notified(self) -> None:
         result = self._service(RecordingNotifier("email", [], should_fail=True)).run(self.now)
         row = self.database.event_row(result.created_events[0])
