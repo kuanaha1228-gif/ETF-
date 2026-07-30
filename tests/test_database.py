@@ -68,7 +68,7 @@ class DatabaseTests(TestCase):
         self.assertIn("recovery_last_trading_date", columns)
         self.assertIn("cycle_peak", columns)
         self.assertIn("paused_for_review", columns)
-        self.assertEqual(version, 5)
+        self.assertEqual(version, 7)
 
     def test_next_cycle_strategy_activates_after_recovery(self) -> None:
         plan = Plan("A500", "022459", "159361", Decimal("600"))

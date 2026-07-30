@@ -7,7 +7,9 @@ from pathlib import Path
 from etf_assistant.gui import (
     _check_result_message,
     _database_path_from_arguments,
+    _decimal_input,
     _money,
+    _parse_take_profit_rules,
     _percent,
 )
 from etf_assistant.service import CheckResult
@@ -19,6 +21,24 @@ class GuiHelperTests(unittest.TestCase):
 
     def test_percent_format(self) -> None:
         self.assertEqual(_percent(Decimal("10.456")), "10.46%")
+
+    def test_fractional_holdings_accept_common_decimal_separators(self) -> None:
+        self.assertEqual(
+            _decimal_input("123.456789", "当前实际持有份额"),
+            Decimal("123.456789"),
+        )
+        self.assertEqual(
+            _decimal_input("123，456789", "当前实际持有份额"),
+            Decimal("123.456789"),
+        )
+        self.assertEqual(
+            _decimal_input(".25", "当前实际持有份额"),
+            Decimal("0.25"),
+        )
+
+    def test_fractional_holdings_reject_more_than_six_places(self) -> None:
+        with self.assertRaisesRegex(ValueError, "最多支持 6 位小数"):
+            _decimal_input("1.1234567", "当前实际持有份额")
 
     def test_background_entry_accepts_an_isolated_database(self) -> None:
         self.assertEqual(
@@ -62,13 +82,69 @@ class GuiHelperTests(unittest.TestCase):
         self.assertIn("var(--rise)", html)
         self.assertIn("var(--fall)", html)
         self.assertIn("不会再弹出系统密码框", html)
+        self.assertIn("止盈基准维护", html)
+        self.assertIn("精确止盈位置", html)
+        self.assertIn("当前阶段定投金额", html)
+        self.assertIn('id="tp-actual-units" type="text" inputmode="decimal"', html)
+        self.assertIn("当前实际持有份额必须是非负数字，最多 6 位小数", html)
+        self.assertIn("记录实际赎回", html)
+        self.assertIn("上一期场外官方净值", html)
+        self.assertIn("QDII / 高误差估值", html)
+        self.assertIn("保存并复核预警", html)
+        self.assertIn("场内 ETF 只提供盘中涨跌信号", html)
+        self.assertIn("archivePlan", html)
+        self.assertIn("takeProfitDrawdown", html)
+        self.assertIn("恢复回撤阈值", html)
+        self.assertIn("恢复后定投金额", html)
+        self.assertIn("删除此档", html)
+        self.assertIn("删除档位", html)
+        self.assertIn("回撤档位 ${Number(duplicate.threshold)}% 重复", html)
+        self.assertIn('class="level-phases"', html)
+        self.assertIn('class="level-interval"', html)
+        self.assertIn("phases.disabled=!phased", html)
+        self.assertIn("interval.disabled=!phased", html)
+        self.assertIn('<form id="plan-form" novalidate>', html)
+        self.assertIn("请填写计划名称、场外基金代码和场内 ETF 代码", html)
+        self.assertIn("后一期检查时仍达到该回撤档位才会提醒", html)
+        self.assertIn("每个自然周最多提醒一次", html)
+        self.assertIn("删除全部档位表示暂不自动恢复定投", html)
         self.assertNotIn("企业微信", html)
+
+    def test_recovery_thresholds_and_amounts_are_frontend_configurable(self) -> None:
+        levels, recovery = _parse_take_profit_rules(
+            """{"levels": [], "recoveryLevels": [
+                {"drawdown": "12.5", "recurringAmount": "180"},
+                {"drawdown": "27", "recurringAmount": "420"}
+            ]}"""
+        )
+        self.assertEqual(levels, ())
+        self.assertEqual(
+            [(level.drawdown, level.recurring_amount) for level in recovery],
+            [
+                (Decimal("12.5"), Decimal("180")),
+                (Decimal("27"), Decimal("420")),
+            ],
+        )
+
+    def test_recovery_rule_requires_both_frontend_values(self) -> None:
+        with self.assertRaisesRegex(ValueError, "必须同时填写"):
+            _parse_take_profit_rules(
+                """{"levels": [], "recoveryLevels": [
+                    {"drawdown": "20", "recurringAmount": ""}
+                ]}"""
+            )
+
+    def test_all_recovery_rules_can_be_removed(self) -> None:
+        _, recovery = _parse_take_profit_rules(
+            """{"levels": [], "recoveryLevels": []}"""
+        )
+        self.assertEqual(recovery, ())
 
     def test_check_errors_are_aggregated_for_the_ui(self) -> None:
         result = CheckResult(4, (), ("raw upstream error 1", "raw upstream error 2"))
         self.assertEqual(
             _check_result_message(result),
-            "已更新 4 项行情，生成 0 条提醒；2 项历史 K 线暂时不可用",
+            "已更新 4 项行情；未执行定投、补仓或止盈策略；2 项历史 K 线暂时不可用",
         )
 
     def test_desktop_builds_include_market_native_library(self) -> None:

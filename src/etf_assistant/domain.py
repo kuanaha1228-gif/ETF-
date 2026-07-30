@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
 from uuid import UUID, uuid4
@@ -40,6 +40,40 @@ class DeliveryState(StrEnum):
     FAILED = "failed"
     RETRYING = "retrying"
     DISABLED = "disabled"
+
+
+class PlanStatus(StrEnum):
+    ACTIVE = "active"
+    ARCHIVED = "archived"
+
+
+class TakeProfitBasisStatus(StrEnum):
+    DRAFT = "draft"
+    LOCKED = "locked"
+    SUPERSEDED = "superseded"
+
+
+class ValuationStatus(StrEnum):
+    ESTIMATED_WARNING = "estimated_warning"
+    NAV_CONFIRMED = "nav_confirmed"
+    NAV_NOT_REACHED = "nav_not_reached"
+
+
+class ValuationType(StrEnum):
+    STANDARD = "standard"
+    QDII_HIGH_ERROR = "qdii_high_error"
+
+
+class StrategyStage(StrEnum):
+    NORMAL = "normal"
+    TAKE_PROFIT = "take_profit"
+    RECOVERY = "recovery"
+
+
+class DecisionPeakType(StrEnum):
+    ROLLING_20D_HIGH = "rolling_20d_high"
+    CYCLE_PEAK = "cycle_peak"
+    TAKE_PROFIT_PEAK = "take_profit_peak"
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,7 +137,9 @@ class Strategy:
         for level in self.levels:
             level.validate()
             if level.threshold in thresholds:
-                raise ValueError("level thresholds must be unique")
+                raise ValueError(
+                    f"回撤档位 {level.threshold.normalize()}% 重复，请修改或删除其中一档"
+                )
             thresholds.add(level.threshold)
 
 
@@ -115,10 +151,12 @@ class Plan:
     base_amount: Decimal
     purchase_name: str = ""
     signal_name: str = ""
+    current_amount: Decimal | None = None
     invest_weekday: int = 3
     recurring_enabled: bool = True
     drawdown_enabled: bool = True
     enabled: bool = True
+    status: PlanStatus = PlanStatus.ACTIVE
     id: UUID = field(default_factory=uuid4)
 
     def validate(self) -> None:
@@ -130,8 +168,14 @@ class Plan:
             raise ValueError("signal_code must be a 6-digit code")
         if self.base_amount <= 0:
             raise ValueError("base_amount must be greater than 0")
+        if self.current_amount is not None and self.current_amount < 0:
+            raise ValueError("current_amount cannot be negative")
         if self.invest_weekday not in range(5):
             raise ValueError("invest_weekday must be between Monday(0) and Friday(4)")
+
+    @property
+    def recurring_amount(self) -> Decimal:
+        return self.current_amount if self.current_amount is not None else self.base_amount
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,3 +192,45 @@ class TriggerDecision:
     drawdown: Decimal
     highest_close: Decimal
     extra_amount: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class DatedClose:
+    trading_date: date
+    close: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class TakeProfitLevel:
+    profit_rate: Decimal
+    sell_ratio: Decimal
+    next_recurring_amount: Decimal
+    sell_all: bool = False
+    enabled: bool = True
+    position: int = 0
+    id: UUID = field(default_factory=uuid4)
+
+    def validate(self) -> None:
+        if not Decimal("0") < self.profit_rate < Decimal("1000"):
+            raise ValueError("profit_rate must be greater than 0")
+        if self.sell_all:
+            if self.sell_ratio != Decimal("100"):
+                raise ValueError("sell_all levels must use a 100% sell ratio")
+        elif not Decimal("0") < self.sell_ratio < Decimal("100"):
+            raise ValueError("sell_ratio must be between 0 and 100")
+        if self.next_recurring_amount < 0:
+            raise ValueError("next_recurring_amount cannot be negative")
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryLevel:
+    drawdown: Decimal
+    recurring_amount: Decimal | None
+    position: int = 0
+    id: UUID = field(default_factory=uuid4)
+
+    def validate(self) -> None:
+        if not Decimal("0") < self.drawdown < Decimal("100"):
+            raise ValueError("drawdown must be between 0 and 100")
+        if self.recurring_amount is not None and self.recurring_amount < 0:
+            raise ValueError("recurring_amount cannot be negative")

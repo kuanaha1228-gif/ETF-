@@ -203,9 +203,13 @@ def restore_backup(backup_path: str | Path, target: Database) -> Path | None:
 
 
 MERGE_TABLES = (
-    "plans", "strategy_versions", "strategy_levels", "drawdown_cycles", "events",
+    "plans", "plan_configuration_versions", "strategy_versions",
+    "strategy_levels", "drawdown_cycles",
+    "take_profit_levels", "recovery_levels", "take_profit_cycles",
+    "fund_nav_records", "events",
+    "take_profit_executions", "recovery_executions",
     "notification_deliveries", "check_runs", "market_snapshots", "settings",
-    "message_templates", "audit_log",
+    "message_templates", "daily_summaries", "audit_log",
 )
 
 
@@ -236,8 +240,9 @@ def merge_backup(backup_path: str | Path, target: Database, conflict: str = "loc
                 if conflict == "import":
                     plan_columns = [
                         "name", "purchase_code", "purchase_name", "signal_code", "signal_name",
-                        "base_amount", "invest_weekday", "recurring_enabled", "drawdown_enabled",
-                        "enabled", "active_strategy_id", "pending_strategy_id", "updated_at",
+                        "base_amount", "current_amount", "invest_weekday",
+                        "recurring_enabled", "drawdown_enabled", "enabled", "status",
+                        "active_strategy_id", "pending_strategy_id", "updated_at",
                     ]
                     assignments = ", ".join(
                         f'"{column}" = (SELECT i."{column}" FROM incoming.plans i WHERE i.id = plans.id)'

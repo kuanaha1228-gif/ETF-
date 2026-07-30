@@ -76,6 +76,7 @@ etf-assistant add-plan \
 
 ## 文档
 
+- [用户使用说明](docs/用户使用手册.md)
 - [完整产品需求文档](docs/PRD.md)
 - [开发指南](docs/development.md)
 - [macOS 部署](docs/macos-installation.md)

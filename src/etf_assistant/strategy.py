@@ -3,7 +3,15 @@ from __future__ import annotations
 from decimal import Decimal, ROUND_HALF_UP
 from uuid import UUID
 
-from .domain import ExecutionMode, Strategy, StrategyLevel, TriggerDecision
+from .domain import (
+    DatedClose,
+    ExecutionMode,
+    RecoveryLevel,
+    Strategy,
+    StrategyLevel,
+    TakeProfitLevel,
+    TriggerDecision,
+)
 
 
 MONEY_QUANT = Decimal("0.01")
@@ -58,6 +66,66 @@ def calculate_drawdown(current_price: Decimal, completed_closes: list[Decimal]) 
     highest = max(valid)
     raw = (highest - current_price) / highest * Decimal("100")
     return max(raw, Decimal("0")), highest
+
+
+def rolling_high(history: list[DatedClose]) -> DatedClose:
+    valid = [item for item in history if item.close > 0]
+    if not valid:
+        raise ValueError("at least one valid completed close is required")
+    highest = max(item.close for item in valid)
+    return max(
+        (item for item in valid if item.close == highest),
+        key=lambda item: item.trading_date,
+    )
+
+
+def drawdown_from_peak(current_price: Decimal, peak: Decimal) -> Decimal:
+    if current_price <= 0 or peak <= 0:
+        raise ValueError("current_price and peak must be greater than 0")
+    return max((peak - current_price) / peak * Decimal("100"), Decimal("0"))
+
+
+def take_profit_target(cost_basis: Decimal, profit_rate: Decimal) -> Decimal:
+    if cost_basis <= 0:
+        raise ValueError("cost_basis must be greater than 0")
+    return cost_basis * (Decimal("1") + profit_rate / Decimal("100"))
+
+
+def estimate_linked_fund_nav(
+    previous_official_nav: Decimal,
+    signal_previous_close: Decimal,
+    signal_current_price: Decimal,
+) -> tuple[Decimal, Decimal]:
+    if min(previous_official_nav, signal_previous_close, signal_current_price) <= 0:
+        raise ValueError("NAV and signal prices must be greater than 0")
+    signal_return = signal_current_price / signal_previous_close - Decimal("1")
+    return previous_official_nav * (Decimal("1") + signal_return), signal_return
+
+
+def planned_sell_units(
+    actual_units: Decimal, level: TakeProfitLevel
+) -> Decimal:
+    level.validate()
+    if actual_units < 0:
+        raise ValueError("actual_units cannot be negative")
+    if level.sell_all:
+        return actual_units
+    return actual_units * level.sell_ratio / Decimal("100")
+
+
+def next_recovery_level(
+    drawdown: Decimal,
+    levels: tuple[RecoveryLevel, ...],
+    triggered_ids: set[UUID],
+) -> RecoveryLevel | None:
+    eligible = [
+        level
+        for level in levels
+        if level.id not in triggered_ids
+        and level.recurring_amount is not None
+        and drawdown >= level.drawdown
+    ]
+    return max(eligible, key=lambda item: item.drawdown) if eligible else None
 
 
 def choose_level(drawdown: Decimal, strategy: Strategy) -> StrategyLevel | None:

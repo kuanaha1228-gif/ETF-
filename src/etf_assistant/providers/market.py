@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Protocol
 
-from ..domain import Quote
+from ..domain import DatedClose, Quote
 
 
 _SPLIT_FACTORS = tuple(Decimal(value) for value in ("0.2", "0.25", "0.333333", "0.5", "2", "3", "4", "5", "10"))
@@ -53,6 +53,8 @@ class MarketProvider(Protocol):
 
     def completed_closes(self, symbol: str, count: int = 20) -> list[Decimal]: ...
 
+    def completed_history(self, symbol: str, count: int = 20) -> list[DatedClose]: ...
+
 
 class TradingCalendar(Protocol):
     def is_trading_day(self, value: date) -> bool: ...
@@ -69,12 +71,25 @@ class WeekdayCalendar:
 class StaticMarketProvider:
     quotes: dict[str, Quote]
     closes: dict[str, list[Decimal]]
+    dates: dict[str, list[date]] | None = None
 
     def latest_quotes(self, symbols: list[str]) -> dict[str, Quote]:
         return {symbol: self.quotes[symbol] for symbol in symbols if symbol in self.quotes}
 
     def completed_closes(self, symbol: str, count: int = 20) -> list[Decimal]:
         return self.closes[symbol][-count:]
+
+    def completed_history(self, symbol: str, count: int = 20) -> list[DatedClose]:
+        closes = self.completed_closes(symbol, count)
+        dates = (
+            self.dates[symbol][-len(closes):]
+            if self.dates and symbol in self.dates
+            else [date(2000, 1, 1) + timedelta(days=index) for index in range(len(closes))]
+        )
+        return [
+            DatedClose(trading_date=trading_date, close=close)
+            for trading_date, close in zip(dates, closes)
+        ]
 
 
 class AkshareMarketProvider:
@@ -109,16 +124,24 @@ class AkshareMarketProvider:
         return result
 
     def completed_closes(self, symbol: str, count: int = 20) -> list[Decimal]:
+        return [item.close for item in self.completed_history(symbol, count)]
+
+    def completed_history(self, symbol: str, count: int = 20) -> list[DatedClose]:
         try:
             frame = self.ak.fund_etf_hist_em(symbol=symbol, period="daily", adjust="qfq")
-            if "收盘" not in frame.columns:
-                raise RuntimeError("AKShare ETF history response is missing the close column")
+            if "收盘" not in frame.columns or "日期" not in frame.columns:
+                raise RuntimeError("AKShare ETF history response is missing date or close")
             today = date.today().isoformat()
-            if "日期" in frame.columns:
-                frame = frame[frame["日期"].astype(str) < today]
-            closes = [Decimal(str(value)) for value in frame["收盘"].tail(count).tolist()]
-            if len(closes) >= count:
-                return closes
+            frame = frame[frame["日期"].astype(str) < today].tail(count)
+            history = [
+                DatedClose(
+                    trading_date=date.fromisoformat(str(row["日期"])[:10]),
+                    close=Decimal(str(row["收盘"])),
+                )
+                for row in frame.to_dict("records")
+            ]
+            if len(history) >= count:
+                return history
         except Exception:
             pass
         today = date.today().isoformat()
@@ -128,7 +151,13 @@ class AkshareMarketProvider:
         ]
         if len(candles) < count or not _history_is_safe_for_signals(candles):
             raise RuntimeError("历史行情无法安全复权，已跳过回撤提醒")
-        return [Decimal(candle["close"]) for candle in candles[-count:]]
+        return [
+            DatedClose(
+                trading_date=date.fromisoformat(candle["date"]),
+                close=Decimal(candle["close"]),
+            )
+            for candle in candles[-count:]
+        ]
 
     def daily_candles(self, symbol: str, count: int = 30) -> list[dict[str, str]]:
         exchange_symbol = ("sh" if symbol.startswith(("5", "6", "9")) else "sz") + symbol

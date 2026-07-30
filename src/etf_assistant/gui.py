@@ -4,6 +4,7 @@ import json
 import platform
 import sys
 import threading
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -11,12 +12,23 @@ from uuid import UUID, uuid4
 from .backup import export_backup, restore_backup
 from .config import default_database_path
 from .db import Database
-from .domain import EffectiveMode, EventState, ExecutionMode, ExecutionStatus, Plan, Strategy, StrategyLevel
-from .presets import install_prd_plan_presets
+from .domain import (
+    EffectiveMode,
+    EventState,
+    ExecutionMode,
+    ExecutionStatus,
+    Plan,
+    RecoveryLevel,
+    Strategy,
+    StrategyLevel,
+    TakeProfitLevel,
+    ValuationType,
+)
+from .presets import install_prd_plan_presets, install_v17_take_profit_rules
 from .providers.credentials import LocalCredentialStore
 from .providers.notify import SmtpEmailNotifier
 from .scheduler import ensure_scheduler
-from .strategy import STRATEGY_TEMPLATES, default_strategy
+from .strategy import STRATEGY_TEMPLATES, default_strategy, take_profit_target
 
 
 WEEKDAYS = ("周一", "周二", "周三", "周四", "周五")
@@ -38,8 +50,22 @@ def _percent(value: object) -> str:
     return f"{Decimal(str(value)):.2f}%"
 
 
+def _decimal_input(value: object, label: str) -> Decimal:
+    text = str(value).strip().translate(
+        str.maketrans({"，": ".", ",": ".", "。": ".", "．": "."})
+    )
+    if text.startswith("."):
+        text = "0" + text
+    if not text or text.count(".") > 1:
+        raise ValueError(f"{label}格式不正确")
+    whole, separator, fraction = text.partition(".")
+    if not whole.isdigit() or (separator and (not fraction.isdigit() or len(fraction) > 6)):
+        raise ValueError(f"{label}最多支持 6 位小数")
+    return Decimal(text)
+
+
 def _check_result_message(result) -> str:
-    message = f"已更新 {result.checked_plans} 项行情，生成 {len(result.created_events)} 条提醒"
+    message = f"已更新 {result.checked_plans} 项行情；未执行定投、补仓或止盈策略"
     if result.errors:
         message += f"；{len(result.errors)} 项历史 K 线暂时不可用"
     return message
@@ -66,6 +92,13 @@ def _database_path_from_arguments(arguments: list[str]) -> Path:
 def _plan_payload(database: Database, plan: Plan) -> dict[str, object]:
     strategy = database.get_active_strategy(plan.id)
     cycle = database.get_active_cycle(plan.id)
+    take_profit_cycle = database.current_take_profit_cycle(plan.id)
+    take_profit_levels = database.take_profit_levels(plan.id)
+    recovery_levels = database.recovery_levels(plan.id)
+    executed_take_profit = (
+        database.executed_take_profit_level_ids(UUID(take_profit_cycle["id"]))
+        if take_profit_cycle else set()
+    )
     return {
         "id": str(plan.id),
         "name": plan.name,
@@ -74,6 +107,7 @@ def _plan_payload(database: Database, plan: Plan) -> dict[str, object]:
         "signalCode": plan.signal_code,
         "signalName": plan.signal_name,
         "baseAmount": str(plan.base_amount),
+        "currentAmount": str(plan.recurring_amount),
         "weekday": plan.invest_weekday,
         "weekdayLabel": WEEKDAYS[plan.invest_weekday],
         "recurringEnabled": plan.recurring_enabled,
@@ -81,12 +115,82 @@ def _plan_payload(database: Database, plan: Plan) -> dict[str, object]:
         "enabled": plan.enabled,
         "pausedForReview": bool(cycle["paused_for_review"]) if cycle else False,
         "cyclePeak": cycle["cycle_peak"] if cycle else None,
+        "takeProfit": {
+            "cycleId": take_profit_cycle["id"] if take_profit_cycle else None,
+            "costBasis": (
+                take_profit_cycle["cost_basis"] if take_profit_cycle else None
+            ),
+            "actualUnits": (
+                take_profit_cycle["actual_units"] if take_profit_cycle else "0"
+            ),
+            "basisStatus": (
+                take_profit_cycle["basis_status"] if take_profit_cycle else "draft"
+            ),
+            "effectiveDate": (
+                take_profit_cycle["effective_date"] if take_profit_cycle else None
+            ),
+            "peak": (
+                take_profit_cycle["take_profit_peak"] if take_profit_cycle else None
+            ),
+            "state": take_profit_cycle["state"] if take_profit_cycle else "preparing",
+            "previousOfficialNav": (
+                take_profit_cycle["previous_official_nav"]
+                if take_profit_cycle else None
+            ),
+            "previousOfficialNavDate": (
+                take_profit_cycle["previous_official_nav_date"]
+                if take_profit_cycle else None
+            ),
+            "valuationType": (
+                take_profit_cycle["valuation_type"]
+                if take_profit_cycle else ValuationType.STANDARD.value
+            ),
+            "basisReviewStatus": (
+                take_profit_cycle["basis_review_status"]
+                if take_profit_cycle else "needs_review"
+            ),
+            "levels": [
+                {
+                    "id": str(level.id),
+                    "profitRate": str(level.profit_rate),
+                    "sellRatio": str(level.sell_ratio),
+                    "sellAll": level.sell_all,
+                    "nextRecurringAmount": str(level.next_recurring_amount),
+                    "targetPrice": (
+                        str(
+                            take_profit_target(
+                                Decimal(take_profit_cycle["cost_basis"]),
+                                level.profit_rate,
+                            )
+                        )
+                        if take_profit_cycle
+                        and take_profit_cycle["cost_basis"] is not None
+                        else None
+                    ),
+                    "executed": level.id in executed_take_profit,
+                }
+                for level in take_profit_levels
+            ],
+            "recoveryLevels": [
+                {
+                    "id": str(level.id),
+                    "drawdown": str(level.drawdown),
+                    "recurringAmount": (
+                        str(level.recurring_amount)
+                        if level.recurring_amount is not None else None
+                    ),
+                }
+                for level in recovery_levels
+            ],
+        },
         "levels": [
-            {
-                "threshold": str(level.threshold),
-                "multiplier": str(level.multiplier),
-                "executionMode": level.execution_mode.value,
-                "enabled": level.enabled,
+                {
+                    "threshold": str(level.threshold),
+                    "multiplier": str(level.multiplier),
+                    "executionMode": level.execution_mode.value,
+                    "phases": level.phases,
+                    "intervalWeeks": level.interval_weeks,
+                    "enabled": level.enabled,
                 "maxExecutions": level.max_executions,
                 "cycleAmountCap": (
                     str(level.cycle_amount_cap) if level.cycle_amount_cap else None
@@ -101,10 +205,43 @@ def _plan_payload(database: Database, plan: Plan) -> dict[str, object]:
     }
 
 
+def _parse_take_profit_rules(
+    payload_text: str,
+) -> tuple[tuple[TakeProfitLevel, ...], tuple[RecoveryLevel, ...]]:
+    payload = json.loads(payload_text)
+    levels = tuple(
+        TakeProfitLevel(
+            profit_rate=Decimal(str(item["profitRate"])),
+            sell_ratio=(
+                Decimal("100")
+                if item.get("sellAll")
+                else Decimal(str(item["sellRatio"]))
+            ),
+            sell_all=bool(item.get("sellAll")),
+            next_recurring_amount=Decimal(str(item["nextRecurringAmount"])),
+        )
+        for item in payload.get("levels", [])
+    )
+    recovery = []
+    for item in payload.get("recoveryLevels", []):
+        drawdown = str(item.get("drawdown", "")).strip()
+        recurring_amount = str(item.get("recurringAmount", "")).strip()
+        if not drawdown or not recurring_amount:
+            raise ValueError("每个恢复档位必须同时填写回撤阈值和恢复金额")
+        recovery.append(
+            RecoveryLevel(
+                drawdown=Decimal(drawdown),
+                recurring_amount=Decimal(recurring_amount),
+            )
+        )
+    return levels, tuple(recovery)
+
+
 def main() -> int:
     database = Database(_database_path_from_arguments(sys.argv[1:]))
     database.initialize()
     install_prd_plan_presets(database)
+    install_v17_take_profit_rules(database)
     if "--daily-check" in sys.argv:
         from .runtime import run_daily_check
 
@@ -147,9 +284,16 @@ def main() -> int:
                     "quoteTime": row["quote_time"],
                     "dailyChange": row["daily_change"],
                     "highestClose": row["highest_close"],
+                    "highestCloseDate": row["highest_close_date"],
                     "drawdown": row["drawdown"],
                     "cyclePeak": row["cycle_peak"],
                     "cycleDrawdown": row["cycle_drawdown"],
+                    "strategyStage": row["strategy_stage"],
+                    "decisionPeakType": row["decision_peak_type"],
+                    "decisionPeakPrice": row["decision_peak_price"],
+                    "decisionPeakDate": row["decision_peak_date"],
+                    "takeProfitPeak": row["take_profit_peak"],
+                    "takeProfitDrawdown": row["take_profit_drawdown"],
                     "updatedAt": row["updated_at"],
                 }
                 for row in database.market_snapshots()
@@ -161,10 +305,14 @@ def main() -> int:
                     "events": [
                         {
                             "id": row["id"],
+                            "planId": row["plan_id"],
                             "planName": row["plan_name"],
                             "quoteTime": row["quote_time"],
                             "tradingDate": row["trading_date"],
                             "drawdown": str(row["drawdown"]),
+                            "eventType": row["event_type"],
+                            "decisionPeakType": row["decision_peak_type"],
+                            "decisionPeakPrice": row["decision_peak_price"],
                             "threshold": row["threshold_snapshot"],
                             "regularAmount": str(row["regular_amount"]),
                             "extraAmount": str(row["extra_amount"]),
@@ -173,8 +321,36 @@ def main() -> int:
                             "executionStatus": row["execution_status"],
                             "executedAmount": row["executed_amount"],
                             "executedAt": row["executed_at"],
+                            "takeProfitTargetPrice": row["take_profit_target_price"],
+                            "sellRatio": row["sell_ratio_snapshot"],
+                            "plannedSellUnits": row["planned_sell_units"],
+                            "actualSellUnits": row["actual_sell_units"],
+                            "recurringAmountBefore": row["recurring_amount_before"],
+                            "recurringAmountAfter": row["recurring_amount_after"],
+                            "valuationStatus": row["valuation_status"],
+                            "valuationType": row["valuation_type"],
+                            "estimatedNav": row["estimated_nav"],
+                            "referenceNav": row["reference_nav"],
+                            "referenceNavDate": row["reference_nav_date"],
+                            "signalPreviousClose": row["signal_previous_close"],
+                            "signalIntradayReturn": row["signal_intraday_return"],
+                            "officialNav": row["official_nav"],
+                            "officialNavDate": row["official_nav_date"],
                         }
                         for row in events
+                    ],
+                    "dailySummaries": [
+                        {
+                            "id": row["id"],
+                            "tradingDate": row["trading_date"],
+                            "recipient": row["email_recipient"],
+                            "subject": row["subject"],
+                            "state": row["state"],
+                            "attempts": row["attempts"],
+                            "sentAt": row["sent_at"],
+                            "errorSummary": row["error_summary"],
+                        }
+                        for row in database.recent_daily_summaries()
                     ],
                     "runtime": {
                         "schedulerInstalled": scheduler_ready,
@@ -223,6 +399,9 @@ def main() -> int:
                     signal_code=payload["signalCode"].strip(),
                     signal_name=payload["signalName"].strip(),
                     base_amount=Decimal(str(payload["baseAmount"])),
+                    current_amount=Decimal(
+                        str(payload.get("currentAmount", payload["baseAmount"]))
+                    ),
                     invest_weekday=int(payload["weekday"]),
                     recurring_enabled=bool(payload["recurringEnabled"]),
                     drawdown_enabled=bool(payload["drawdownEnabled"]),
@@ -233,7 +412,16 @@ def main() -> int:
                         threshold=Decimal(str(item["threshold"])),
                         multiplier=Decimal(str(item["multiplier"])),
                         execution_mode=ExecutionMode(item.get("executionMode", "once")),
-                        phases=2 if item.get("executionMode") == "phased" else 1,
+                        phases=(
+                            int(item.get("phases", 2))
+                            if item.get("executionMode") == "phased"
+                            else 1
+                        ),
+                        interval_weeks=(
+                            int(item.get("intervalWeeks", 1))
+                            if item.get("executionMode") == "phased"
+                            else 1
+                        ),
                         enabled=bool(item.get("enabled", True)),
                         max_executions=(
                             int(item["maxExecutions"])
@@ -253,25 +441,38 @@ def main() -> int:
                 plan.validate()
                 if existing:
                     current = database.get_active_strategy(existing.id)
-                    database.update_plan(plan)
-                    if levels and tuple(
+                    strategy_changed = tuple(
                         (
                             level.threshold, level.multiplier, level.execution_mode,
-                            level.enabled, level.max_executions, level.cycle_amount_cap,
+                            level.phases, level.interval_weeks, level.enabled,
+                            level.max_executions, level.cycle_amount_cap,
                             level.cycle_multiplier_cap,
                         )
                         for level in levels
                     ) != tuple(
                         (
                             level.threshold, level.multiplier, level.execution_mode,
-                            level.enabled, level.max_executions, level.cycle_amount_cap,
+                            level.phases, level.interval_weeks, level.enabled,
+                            level.max_executions, level.cycle_amount_cap,
                             level.cycle_multiplier_cap,
                         )
                         for level in current.levels
-                    ):
-                        database.save_strategy(
-                            Strategy(plan.id, current.version + 1, levels, EffectiveMode.IMMEDIATE)
+                    )
+                    next_strategy = (
+                        Strategy(
+                            plan.id,
+                            current.version + 1,
+                            levels,
+                            EffectiveMode.IMMEDIATE,
                         )
+                        if strategy_changed
+                        else None
+                    )
+                    if next_strategy:
+                        next_strategy.validate()
+                    database.update_plan(plan)
+                    if next_strategy:
+                        database.save_strategy(next_strategy)
                 else:
                     strategy = Strategy(plan.id, 1, levels, EffectiveMode.IMMEDIATE) if levels else default_strategy(plan.id)
                     database.add_plan_with_strategy(plan, strategy)
@@ -293,6 +494,7 @@ def main() -> int:
                         signal_code=current.signal_code,
                         signal_name=current.signal_name,
                         base_amount=current.base_amount,
+                        current_amount=current.current_amount,
                         invest_weekday=current.invest_weekday,
                         recurring_enabled=recurring_enabled,
                         drawdown_enabled=drawdown_enabled,
@@ -308,6 +510,93 @@ def main() -> int:
         def resumeCycle(self, plan_id: str) -> str:
             try:
                 database.resume_cycle(UUID(plan_id))
+                self.stateChanged.emit()
+                return ""
+            except Exception as error:
+                return str(error)
+
+        @QtCore.Slot(str, result=str)
+        def archivePlan(self, plan_id: str) -> str:
+            try:
+                database.archive_plan(UUID(plan_id))
+                self.stateChanged.emit()
+                return ""
+            except Exception as error:
+                return str(error)
+
+        @QtCore.Slot(str, str, result=str)
+        def saveTakeProfitRules(self, plan_id: str, payload_text: str) -> str:
+            try:
+                levels, recovery = _parse_take_profit_rules(payload_text)
+                database.replace_take_profit_rules(UUID(plan_id), levels, recovery)
+                self.stateChanged.emit()
+                return ""
+            except Exception as error:
+                return str(error)
+
+        @QtCore.Slot(str, str, bool, bool, result=str)
+        def saveTakeProfitBasis(
+            self,
+            plan_id: str,
+            payload_text: str,
+            lock: bool,
+            confirm_correction: bool,
+        ) -> str:
+            try:
+                payload = json.loads(payload_text)
+                database.save_take_profit_basis(
+                    UUID(plan_id),
+                    actual_units=_decimal_input(
+                        payload.get("actualUnits", ""), "当前实际持有份额"
+                    ),
+                    cost_basis=_decimal_input(
+                        payload.get("costBasis", ""), "本轮止盈基准成本"
+                    ),
+                    lock=lock,
+                    confirm_correction=confirm_correction,
+                    previous_official_nav=(
+                        _decimal_input(
+                            payload.get("previousOfficialNav", ""),
+                            "上一期场外官方净值",
+                        )
+                        if str(payload.get("previousOfficialNav", "")).strip()
+                        else None
+                    ),
+                    previous_official_nav_date=(
+                        date.fromisoformat(payload["previousOfficialNavDate"])
+                        if payload.get("previousOfficialNavDate") else None
+                    ),
+                    valuation_type=ValuationType(
+                        payload.get("valuationType", ValuationType.STANDARD.value)
+                    ),
+                )
+                self.stateChanged.emit()
+                return ""
+            except Exception as error:
+                return str(error)
+
+        @QtCore.Slot(str, str, str, result=str)
+        def recordOfficialNav(
+            self, plan_id: str, nav_date: str, official_nav: str
+        ) -> str:
+            try:
+                reconciled = database.record_official_nav(
+                    UUID(plan_id),
+                    nav_date=date.fromisoformat(nav_date),
+                    official_nav=_decimal_input(official_nav, "场外官方净值"),
+                )
+                self.stateChanged.emit()
+                return f"官方净值已保存，已复核 {reconciled} 条盘中止盈预警"
+            except Exception as error:
+                return str(error)
+
+        @QtCore.Slot(str, str, result=str)
+        def confirmTakeProfit(self, event_id: str, actual_units: str) -> str:
+            try:
+                database.confirm_take_profit_execution(
+                    UUID(event_id),
+                    actual_sell_units=_decimal_input(actual_units, "实际卖出份额"),
+                )
                 self.stateChanged.emit()
                 return ""
             except Exception as error:
@@ -384,6 +673,11 @@ def main() -> int:
                     database.update_event_action(UUID(event_id), state=EventState.IGNORED)
                 elif action == "postponed":
                     database.update_event_action(UUID(event_id), state=EventState.POSTPONED)
+                elif action == "not_executed":
+                    database.update_event_action(
+                        UUID(event_id),
+                        execution_status=ExecutionStatus.NOT_EXECUTED,
+                    )
                 self.stateChanged.emit()
                 return ""
             except Exception as error:

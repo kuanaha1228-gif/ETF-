@@ -138,14 +138,22 @@ def run_daily_check(
             )
         lock_path = app_data_dir() / "run" / "daily_check.lock"
         with ProcessLock(lock_path):
-            configuration_errors = notification_configuration_errors(database, credentials)
+            configuration_errors = (
+                ()
+                if force
+                else notification_configuration_errors(database, credentials)
+            )
             service = DailyCheckService(
                 database=database,
                 market=AkshareMarketProvider(),
                 calendar=AkshareTradingCalendar(),
                 notifiers=build_notifiers(database, credentials),
             )
-            result = service.run(now)
+            result = service.run(
+                now,
+                scheduled=not force,
+                check_run_id=run_id,
+            )
             result = replace(result, errors=result.errors + configuration_errors)
         database.finish_check_run(
             run_id,

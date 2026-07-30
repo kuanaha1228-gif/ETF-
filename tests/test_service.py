@@ -121,7 +121,7 @@ class DailyCheckTests(TestCase):
         row = self.database.event_row(deeper.created_events[0])
         self.assertEqual(row["state"], "suppressed")
         self.assertEqual(row["extra_amount"], "0.00")
-        self.assertIn("本周已经发送过一次补仓计划", messages[-1][1])
+        self.assertIn("本周已补仓，本次新增金额 0 元", messages[-1][1])
         self.assertEqual(len(messages), 2)
 
         service.run(next_day)
@@ -260,7 +260,7 @@ class DailyCheckTests(TestCase):
             [RecordingNotifier("email", messages)],
         ).run(blocked_date)
         self.assertEqual(len(blocked.created_events), 0)
-        self.assertEqual(len(messages), 4)
+        self.assertEqual(len(messages), 5)
 
         self.database.resume_cycle(self.plan.id)
         resumed_date = self.now + timedelta(days=35)
@@ -273,4 +273,4 @@ class DailyCheckTests(TestCase):
             [RecordingNotifier("email", messages)],
         ).run(resumed_date)
         self.assertEqual(len(resumed.created_events), 1)
-        self.assertEqual(len(messages), 5)
+        self.assertEqual(len(messages), 6)

@@ -10,18 +10,25 @@ from typing import Iterator
 from uuid import UUID, uuid4
 
 from .domain import (
+    DecisionPeakType,
     DeliveryState,
     EffectiveMode,
     EventState,
     ExecutionMode,
     ExecutionStatus,
     Plan,
+    PlanStatus,
+    RecoveryLevel,
     Strategy,
     StrategyLevel,
+    TakeProfitBasisStatus,
+    TakeProfitLevel,
+    ValuationStatus,
+    ValuationType,
 )
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 SENSITIVE_SETTING_MARKERS = ("password", "secret", "token", "webhook", "authorization")
 
 
@@ -34,10 +41,12 @@ CREATE TABLE IF NOT EXISTS plans (
     signal_code TEXT NOT NULL,
     signal_name TEXT NOT NULL DEFAULT '',
     base_amount TEXT NOT NULL,
+    current_amount TEXT NOT NULL,
     invest_weekday INTEGER NOT NULL,
     recurring_enabled INTEGER NOT NULL,
     drawdown_enabled INTEGER NOT NULL,
     enabled INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
     active_strategy_id TEXT,
     pending_strategy_id TEXT,
     created_at TEXT NOT NULL,
@@ -49,6 +58,15 @@ CREATE TABLE IF NOT EXISTS strategy_versions (
     plan_id TEXT NOT NULL REFERENCES plans(id),
     version INTEGER NOT NULL,
     effective_mode TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(plan_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS plan_configuration_versions (
+    id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL REFERENCES plans(id),
+    version INTEGER NOT NULL,
+    snapshot_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
     UNIQUE(plan_id, version)
 );
@@ -102,12 +120,35 @@ CREATE TABLE IF NOT EXISTS events (
     daily_change TEXT,
     highest_close TEXT NOT NULL,
     drawdown TEXT NOT NULL,
+    rolling_20d_high_date TEXT,
+    decision_peak_type TEXT,
+    decision_peak_price TEXT,
+    decision_peak_date TEXT,
     threshold_snapshot TEXT,
     multiplier_snapshot TEXT,
     execution_mode_snapshot TEXT,
     regular_amount TEXT NOT NULL,
     extra_amount TEXT NOT NULL,
     total_amount TEXT NOT NULL,
+    take_profit_cycle_id TEXT,
+    take_profit_level_id TEXT,
+    take_profit_cost_basis TEXT,
+    take_profit_target_price TEXT,
+    sell_ratio_snapshot TEXT,
+    planned_sell_units TEXT,
+    actual_sell_units TEXT,
+    recurring_amount_before TEXT,
+    recurring_amount_after TEXT,
+    valuation_status TEXT,
+    valuation_type TEXT,
+    estimated_nav TEXT,
+    reference_nav TEXT,
+    reference_nav_date TEXT,
+    signal_previous_close TEXT,
+    signal_intraday_return TEXT,
+    official_nav TEXT,
+    official_nav_date TEXT,
+    reconciled_at TEXT,
     state TEXT NOT NULL,
     execution_status TEXT NOT NULL,
     executed_amount TEXT,
@@ -146,9 +187,17 @@ CREATE TABLE IF NOT EXISTS market_snapshots (
     quote_time TEXT NOT NULL,
     daily_change TEXT,
     highest_close TEXT,
+    highest_close_date TEXT,
     drawdown TEXT,
     cycle_peak TEXT,
     cycle_drawdown TEXT,
+    strategy_stage TEXT NOT NULL DEFAULT 'normal',
+    decision_peak_type TEXT,
+    decision_peak_price TEXT,
+    decision_peak_date TEXT,
+    take_profit_peak TEXT,
+    take_profit_peak_date TEXT,
+    take_profit_drawdown TEXT,
     updated_at TEXT NOT NULL
 );
 
@@ -176,6 +225,104 @@ CREATE TABLE IF NOT EXISTS audit_log (
     entity_id TEXT,
     details_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS take_profit_levels (
+    id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL REFERENCES plans(id),
+    profit_rate TEXT NOT NULL,
+    sell_ratio TEXT NOT NULL,
+    sell_all INTEGER NOT NULL DEFAULT 0,
+    next_recurring_amount TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    position INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(plan_id, profit_rate)
+);
+
+CREATE TABLE IF NOT EXISTS recovery_levels (
+    id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL REFERENCES plans(id),
+    drawdown TEXT NOT NULL,
+    recurring_amount TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    position INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(plan_id, drawdown)
+);
+
+CREATE TABLE IF NOT EXISTS take_profit_cycles (
+    id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL REFERENCES plans(id),
+    cost_basis TEXT,
+    actual_units TEXT NOT NULL DEFAULT '0',
+    basis_status TEXT NOT NULL DEFAULT 'draft',
+    effective_date TEXT,
+    take_profit_peak TEXT,
+    take_profit_peak_date TEXT,
+    previous_official_nav TEXT,
+    previous_official_nav_date TEXT,
+    valuation_type TEXT NOT NULL DEFAULT 'standard',
+    basis_review_status TEXT NOT NULL DEFAULT 'needs_review',
+    state TEXT NOT NULL DEFAULT 'preparing',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS one_current_take_profit_cycle_per_plan
+ON take_profit_cycles(plan_id) WHERE state IN ('preparing', 'active', 'recovering');
+
+CREATE TABLE IF NOT EXISTS fund_nav_records (
+    id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL REFERENCES plans(id),
+    nav_date TEXT NOT NULL,
+    official_nav TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(plan_id, nav_date)
+);
+
+CREATE TABLE IF NOT EXISTS take_profit_executions (
+    id TEXT PRIMARY KEY,
+    cycle_id TEXT NOT NULL REFERENCES take_profit_cycles(id),
+    level_id TEXT NOT NULL REFERENCES take_profit_levels(id),
+    event_id TEXT NOT NULL REFERENCES events(id),
+    actual_sell_units TEXT NOT NULL,
+    quote_price TEXT NOT NULL,
+    recurring_amount_before TEXT NOT NULL,
+    recurring_amount_after TEXT NOT NULL,
+    executed_at TEXT NOT NULL,
+    UNIQUE(cycle_id, level_id)
+);
+
+CREATE TABLE IF NOT EXISTS recovery_executions (
+    id TEXT PRIMARY KEY,
+    cycle_id TEXT NOT NULL REFERENCES take_profit_cycles(id),
+    level_id TEXT NOT NULL REFERENCES recovery_levels(id),
+    event_id TEXT NOT NULL REFERENCES events(id),
+    recurring_amount_before TEXT NOT NULL,
+    recurring_amount_after TEXT NOT NULL,
+    triggered_at TEXT NOT NULL,
+    UNIQUE(cycle_id, level_id)
+);
+
+CREATE TABLE IF NOT EXISTS daily_summaries (
+    id TEXT PRIMARY KEY,
+    check_run_id TEXT,
+    trading_date TEXT NOT NULL,
+    scheduled_check INTEGER NOT NULL,
+    email_recipient TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    body TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    state TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    attempted_at TEXT,
+    sent_at TEXT,
+    error_summary TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(trading_date, scheduled_check, email_recipient)
 );
 """
 
@@ -323,6 +470,116 @@ class Database:
                         """
                     )
                     connection.execute("PRAGMA user_version = 5")
+                if current < 6:
+                    plan_columns = {
+                        row["name"] for row in connection.execute("PRAGMA table_info(plans)")
+                    }
+                    if "current_amount" not in plan_columns:
+                        connection.execute(
+                            "ALTER TABLE plans ADD COLUMN current_amount TEXT NOT NULL DEFAULT '0'"
+                        )
+                        connection.execute(
+                            "UPDATE plans SET current_amount = base_amount WHERE current_amount = '0'"
+                        )
+                    if "status" not in plan_columns:
+                        connection.execute(
+                            "ALTER TABLE plans ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"
+                        )
+                    event_columns = {
+                        row["name"] for row in connection.execute("PRAGMA table_info(events)")
+                    }
+                    for column, definition in (
+                        ("rolling_20d_high_date", "TEXT"),
+                        ("decision_peak_type", "TEXT"),
+                        ("decision_peak_price", "TEXT"),
+                        ("decision_peak_date", "TEXT"),
+                        ("take_profit_cycle_id", "TEXT"),
+                        ("take_profit_level_id", "TEXT"),
+                        ("take_profit_cost_basis", "TEXT"),
+                        ("take_profit_target_price", "TEXT"),
+                        ("sell_ratio_snapshot", "TEXT"),
+                        ("planned_sell_units", "TEXT"),
+                        ("actual_sell_units", "TEXT"),
+                        ("recurring_amount_before", "TEXT"),
+                        ("recurring_amount_after", "TEXT"),
+                    ):
+                        if column not in event_columns:
+                            connection.execute(
+                                f"ALTER TABLE events ADD COLUMN {column} {definition}"
+                            )
+                    snapshot_columns = {
+                        row["name"]
+                        for row in connection.execute("PRAGMA table_info(market_snapshots)")
+                    }
+                    for column, definition in (
+                        ("highest_close_date", "TEXT"),
+                        ("strategy_stage", "TEXT NOT NULL DEFAULT 'normal'"),
+                        ("decision_peak_type", "TEXT"),
+                        ("decision_peak_price", "TEXT"),
+                        ("decision_peak_date", "TEXT"),
+                        ("take_profit_peak", "TEXT"),
+                        ("take_profit_peak_date", "TEXT"),
+                        ("take_profit_drawdown", "TEXT"),
+                    ):
+                        if column not in snapshot_columns:
+                            connection.execute(
+                                f"ALTER TABLE market_snapshots ADD COLUMN {column} {definition}"
+                            )
+                    recovery_columns = {
+                        row["name"]
+                        for row in connection.execute("PRAGMA table_info(recovery_levels)")
+                    }
+                    if recovery_columns and "enabled" not in recovery_columns:
+                        connection.execute(
+                            """
+                            ALTER TABLE recovery_levels
+                            ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1
+                            """
+                        )
+                    connection.executescript(SCHEMA_SQL)
+                    connection.execute("PRAGMA user_version = 6")
+                if current < 7:
+                    cycle_columns = {
+                        row["name"]
+                        for row in connection.execute(
+                            "PRAGMA table_info(take_profit_cycles)"
+                        )
+                    }
+                    for column, definition in (
+                        ("previous_official_nav", "TEXT"),
+                        ("previous_official_nav_date", "TEXT"),
+                        ("valuation_type", "TEXT NOT NULL DEFAULT 'standard'"),
+                        (
+                            "basis_review_status",
+                            "TEXT NOT NULL DEFAULT 'needs_review'",
+                        ),
+                    ):
+                        if column not in cycle_columns:
+                            connection.execute(
+                                f"ALTER TABLE take_profit_cycles ADD COLUMN {column} {definition}"
+                            )
+                    event_columns = {
+                        row["name"]
+                        for row in connection.execute("PRAGMA table_info(events)")
+                    }
+                    for column, definition in (
+                        ("valuation_status", "TEXT"),
+                        ("valuation_type", "TEXT"),
+                        ("estimated_nav", "TEXT"),
+                        ("reference_nav", "TEXT"),
+                        ("reference_nav_date", "TEXT"),
+                        ("signal_previous_close", "TEXT"),
+                        ("signal_intraday_return", "TEXT"),
+                        ("official_nav", "TEXT"),
+                        ("official_nav_date", "TEXT"),
+                        ("reconciled_at", "TEXT"),
+                    ):
+                        if column not in event_columns:
+                            connection.execute(
+                                f"ALTER TABLE events ADD COLUMN {column} {definition}"
+                            )
+                    connection.executescript(SCHEMA_SQL)
+                    connection.execute("PRAGMA user_version = 7")
 
     def integrity_check(self) -> bool:
         with self.read() as connection:
@@ -339,18 +596,41 @@ class Database:
                 """
                 INSERT INTO plans (
                     id, name, purchase_code, purchase_name, signal_code, signal_name,
-                    base_amount, invest_weekday, recurring_enabled, drawdown_enabled,
-                    enabled, active_strategy_id, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    base_amount, current_amount, invest_weekday, recurring_enabled,
+                    drawdown_enabled, enabled, status, active_strategy_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(plan.id), plan.name, plan.purchase_code, plan.purchase_name,
                     plan.signal_code, plan.signal_name, str(plan.base_amount),
+                    str(plan.recurring_amount),
                     plan.invest_weekday, int(plan.recurring_enabled),
-                    int(plan.drawdown_enabled), int(plan.enabled), str(strategy.id), now, now,
+                    int(plan.drawdown_enabled), int(plan.enabled), plan.status.value,
+                    str(strategy.id), now, now,
                 ),
             )
             self._insert_strategy(connection, strategy)
+            connection.execute(
+                """
+                INSERT INTO plan_configuration_versions
+                    (id, plan_id, version, snapshot_json, created_at)
+                VALUES (?, ?, 1, ?, ?)
+                """,
+                (
+                    str(uuid4()), str(plan.id),
+                    json.dumps(
+                        {
+                            "base_amount": str(plan.base_amount),
+                            "current_amount": str(plan.recurring_amount),
+                            "invest_weekday": plan.invest_weekday,
+                            "recurring_enabled": plan.recurring_enabled,
+                            "drawdown_enabled": plan.drawdown_enabled,
+                        },
+                        sort_keys=True,
+                    ),
+                    now,
+                ),
+            )
 
     def _insert_strategy(self, connection: sqlite3.Connection, strategy: Strategy) -> None:
         connection.execute(
@@ -402,9 +682,14 @@ class Database:
                 (str(strategy.id), utc_now_text(), str(strategy.plan_id)),
             )
 
-    def list_plans(self) -> list[Plan]:
+    def list_plans(self, *, include_archived: bool = False) -> list[Plan]:
         with self.read() as connection:
-            rows = connection.execute("SELECT * FROM plans ORDER BY created_at").fetchall()
+            query = "SELECT * FROM plans"
+            parameters: tuple[object, ...] = ()
+            if not include_archived:
+                query += " WHERE status = ?"
+                parameters = (PlanStatus.ACTIVE.value,)
+            rows = connection.execute(query + " ORDER BY created_at", parameters).fetchall()
         return [self._row_to_plan(row) for row in rows]
 
     def get_plan(self, plan_id: UUID) -> Plan:
@@ -422,20 +707,49 @@ class Database:
                 UPDATE plans SET
                     name = ?, purchase_code = ?, purchase_name = ?,
                     signal_code = ?, signal_name = ?, base_amount = ?,
-                    invest_weekday = ?, recurring_enabled = ?,
-                    drawdown_enabled = ?, enabled = ?, updated_at = ?
+                    current_amount = ?, invest_weekday = ?, recurring_enabled = ?,
+                    drawdown_enabled = ?, enabled = ?, status = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
                     plan.name, plan.purchase_code, plan.purchase_name,
                     plan.signal_code, plan.signal_name, str(plan.base_amount),
-                    plan.invest_weekday, int(plan.recurring_enabled),
-                    int(plan.drawdown_enabled), int(plan.enabled),
+                    str(plan.recurring_amount), plan.invest_weekday,
+                    int(plan.recurring_enabled), int(plan.drawdown_enabled), int(plan.enabled),
+                    plan.status.value,
                     utc_now_text(), str(plan.id),
                 ),
             )
             if cursor.rowcount != 1:
                 raise KeyError("plan not found")
+            version = connection.execute(
+                """
+                SELECT COALESCE(MAX(version), 0) + 1
+                FROM plan_configuration_versions WHERE plan_id = ?
+                """,
+                (str(plan.id),),
+            ).fetchone()[0]
+            connection.execute(
+                """
+                INSERT INTO plan_configuration_versions
+                    (id, plan_id, version, snapshot_json, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid4()), str(plan.id), version,
+                    json.dumps(
+                        {
+                            "base_amount": str(plan.base_amount),
+                            "current_amount": str(plan.recurring_amount),
+                            "invest_weekday": plan.invest_weekday,
+                            "recurring_enabled": plan.recurring_enabled,
+                            "drawdown_enabled": plan.drawdown_enabled,
+                        },
+                        sort_keys=True,
+                    ),
+                    utc_now_text(),
+                ),
+            )
 
     def recent_events(self, limit: int = 100) -> list[sqlite3.Row]:
         if limit < 1:
@@ -452,6 +766,42 @@ class Database:
                 (limit,),
             ).fetchall()
 
+    def events_for_plan_date(
+        self, plan_id: UUID, trading_date: date
+    ) -> list[sqlite3.Row]:
+        with self.read() as connection:
+            return connection.execute(
+                """
+                SELECT * FROM events
+                WHERE plan_id = ? AND trading_date = ?
+                ORDER BY created_at
+                """,
+                (str(plan_id), trading_date.isoformat()),
+            ).fetchall()
+
+    def recurring_event_exists(self, plan_id: UUID, trading_date: date) -> bool:
+        with self.read() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM events
+                WHERE plan_id = ? AND trading_date = ?
+                  AND CAST(regular_amount AS NUMERIC) > 0
+                LIMIT 1
+                """,
+                (str(plan_id), trading_date.isoformat()),
+            ).fetchone()
+        return row is not None
+
+    def recent_daily_summaries(self, limit: int = 30) -> list[sqlite3.Row]:
+        with self.read() as connection:
+            return connection.execute(
+                """
+                SELECT * FROM daily_summaries
+                ORDER BY created_at DESC LIMIT ?
+                """,
+                (max(limit, 1),),
+            ).fetchall()
+
     def save_market_snapshot(
         self,
         *,
@@ -463,22 +813,38 @@ class Database:
         drawdown: Decimal | None,
         cycle_peak: Decimal | None = None,
         cycle_drawdown: Decimal | None = None,
+        highest_close_date: date | None = None,
+        strategy_stage: str = "normal",
+        decision_peak_type: str | None = None,
+        decision_peak_price: Decimal | None = None,
+        decision_peak_date: date | None = None,
+        take_profit_peak: Decimal | None = None,
+        take_profit_drawdown: Decimal | None = None,
     ) -> None:
         with self.transaction() as connection:
             connection.execute(
                 """
                 INSERT INTO market_snapshots (
                     plan_id, quote_price, quote_time, daily_change,
-                    highest_close, drawdown, cycle_peak, cycle_drawdown, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    highest_close, highest_close_date, drawdown, cycle_peak, cycle_drawdown,
+                    strategy_stage, decision_peak_type, decision_peak_price,
+                    decision_peak_date, take_profit_peak, take_profit_drawdown, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(plan_id) DO UPDATE SET
                     quote_price = excluded.quote_price,
                     quote_time = excluded.quote_time,
                     daily_change = excluded.daily_change,
                     highest_close = excluded.highest_close,
+                    highest_close_date = excluded.highest_close_date,
                     drawdown = excluded.drawdown,
                     cycle_peak = excluded.cycle_peak,
                     cycle_drawdown = excluded.cycle_drawdown,
+                    strategy_stage = excluded.strategy_stage,
+                    decision_peak_type = excluded.decision_peak_type,
+                    decision_peak_price = excluded.decision_peak_price,
+                    decision_peak_date = excluded.decision_peak_date,
+                    take_profit_peak = excluded.take_profit_peak,
+                    take_profit_drawdown = excluded.take_profit_drawdown,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -487,9 +853,16 @@ class Database:
                     quote_time.isoformat(),
                     str(daily_change) if daily_change is not None else None,
                     str(highest_close) if highest_close is not None else None,
+                    highest_close_date.isoformat() if highest_close_date else None,
                     str(drawdown) if drawdown is not None else None,
                     str(cycle_peak) if cycle_peak is not None else None,
                     str(cycle_drawdown) if cycle_drawdown is not None else None,
+                    strategy_stage,
+                    decision_peak_type,
+                    str(decision_peak_price) if decision_peak_price is not None else None,
+                    decision_peak_date.isoformat() if decision_peak_date else None,
+                    str(take_profit_peak) if take_profit_peak is not None else None,
+                    str(take_profit_drawdown) if take_profit_drawdown is not None else None,
                     utc_now_text(),
                 ),
             )
@@ -520,9 +893,12 @@ class Database:
 
     def count_rows(self) -> dict[str, int]:
         tables = (
-            "plans", "strategy_versions", "strategy_levels", "drawdown_cycles",
+            "plans", "plan_configuration_versions", "strategy_versions",
+            "strategy_levels", "drawdown_cycles",
             "events", "notification_deliveries", "check_runs", "market_snapshots", "settings",
-            "message_templates", "audit_log",
+            "message_templates", "audit_log", "take_profit_levels", "recovery_levels",
+            "take_profit_cycles", "take_profit_executions", "recovery_executions",
+            "fund_nav_records", "daily_summaries",
         )
         with self.read() as connection:
             return {
@@ -604,8 +980,10 @@ class Database:
             id=UUID(row["id"]), name=row["name"], purchase_code=row["purchase_code"],
             purchase_name=row["purchase_name"], signal_code=row["signal_code"],
             signal_name=row["signal_name"], base_amount=Decimal(row["base_amount"]),
+            current_amount=Decimal(row["current_amount"]),
             invest_weekday=row["invest_weekday"], recurring_enabled=bool(row["recurring_enabled"]),
             drawdown_enabled=bool(row["drawdown_enabled"]), enabled=bool(row["enabled"]),
+            status=PlanStatus(row["status"]),
         )
 
     @staticmethod
@@ -659,6 +1037,25 @@ class Database:
         idempotency_key: str,
         state: EventState = EventState.CREATED,
         cycle_id: UUID | None = None,
+        rolling_20d_high_date: date | None = None,
+        decision_peak_type: DecisionPeakType | None = None,
+        decision_peak_price: Decimal | None = None,
+        decision_peak_date: date | None = None,
+        take_profit_cycle_id: UUID | None = None,
+        take_profit_level_id: UUID | None = None,
+        take_profit_cost_basis: Decimal | None = None,
+        take_profit_target_price: Decimal | None = None,
+        sell_ratio_snapshot: Decimal | None = None,
+        planned_sell_units: Decimal | None = None,
+        recurring_amount_before: Decimal | None = None,
+        recurring_amount_after: Decimal | None = None,
+        valuation_status: ValuationStatus | None = None,
+        valuation_type: ValuationType | None = None,
+        estimated_nav: Decimal | None = None,
+        reference_nav: Decimal | None = None,
+        reference_nav_date: date | None = None,
+        signal_previous_close: Decimal | None = None,
+        signal_intraday_return: Decimal | None = None,
     ) -> tuple[UUID, bool]:
         event_id = uuid4()
         now = utc_now_text()
@@ -673,10 +1070,20 @@ class Database:
                 INSERT INTO events (
                     id, plan_id, cycle_id, strategy_id, level_id, event_type,
                     trading_date, week_key, quote_price, quote_time, daily_change,
-                    highest_close, drawdown, threshold_snapshot, multiplier_snapshot,
+                    highest_close, drawdown, rolling_20d_high_date, decision_peak_type,
+                    decision_peak_price, decision_peak_date,
+                    threshold_snapshot, multiplier_snapshot,
                     execution_mode_snapshot, regular_amount, extra_amount, total_amount,
+                    take_profit_cycle_id, take_profit_level_id, take_profit_cost_basis,
+                    take_profit_target_price, sell_ratio_snapshot, planned_sell_units,
+                    recurring_amount_before, recurring_amount_after,
+                    valuation_status, valuation_type, estimated_nav, reference_nav, reference_nav_date,
+                    signal_previous_close, signal_intraday_return,
                     state, execution_status, idempotency_key, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
                 """,
                 (
                     str(event_id), str(plan_id), str(cycle_id) if cycle_id else None,
@@ -684,10 +1091,42 @@ class Database:
                     trading_date, week_key, str(quote_price), quote_time.isoformat(),
                     str(daily_change) if daily_change is not None else None,
                     str(highest_close), str(drawdown),
+                    rolling_20d_high_date.isoformat() if rolling_20d_high_date else None,
+                    decision_peak_type.value if decision_peak_type else None,
+                    str(decision_peak_price) if decision_peak_price is not None else None,
+                    decision_peak_date.isoformat() if decision_peak_date else None,
                     str(threshold_snapshot) if threshold_snapshot is not None else None,
                     str(multiplier_snapshot) if multiplier_snapshot is not None else None,
                     execution_mode_snapshot, str(regular_amount), str(extra_amount),
-                    str(regular_amount + extra_amount), state.value,
+                    str(regular_amount + extra_amount),
+                    str(take_profit_cycle_id) if take_profit_cycle_id else None,
+                    str(take_profit_level_id) if take_profit_level_id else None,
+                    str(take_profit_cost_basis) if take_profit_cost_basis is not None else None,
+                    str(take_profit_target_price) if take_profit_target_price is not None else None,
+                    str(sell_ratio_snapshot) if sell_ratio_snapshot is not None else None,
+                    str(planned_sell_units) if planned_sell_units is not None else None,
+                    (
+                        str(recurring_amount_before)
+                        if recurring_amount_before is not None else None
+                    ),
+                    (
+                        str(recurring_amount_after)
+                        if recurring_amount_after is not None else None
+                    ),
+                    valuation_status.value if valuation_status else None,
+                    valuation_type.value if valuation_type else None,
+                    str(estimated_nav) if estimated_nav is not None else None,
+                    str(reference_nav) if reference_nav is not None else None,
+                    reference_nav_date.isoformat() if reference_nav_date else None,
+                    (
+                        str(signal_previous_close)
+                        if signal_previous_close is not None else None
+                    ),
+                    (
+                        str(signal_intraday_return)
+                        if signal_intraday_return is not None else None
+                    ),
+                    state.value,
                     ExecutionStatus.UNKNOWN.value, idempotency_key, now, now,
                 ),
             )
@@ -1051,6 +1490,865 @@ class Database:
                 connection.execute(
                     "UPDATE events SET state = ?, updated_at = ? WHERE id = ?",
                     (EventState.DELIVERY_FAILED.value, utc_now_text(), str(event_id)),
+                )
+
+    def archive_plan(self, plan_id: UUID) -> None:
+        now = utc_now_text()
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM plans WHERE id = ?", (str(plan_id),)
+            ).fetchone()
+            if row is None:
+                raise KeyError("plan not found")
+            if row["status"] == PlanStatus.ARCHIVED.value:
+                return
+            snapshot = dict(row)
+            connection.execute(
+                """
+                UPDATE plans
+                SET status = ?, enabled = 0, updated_at = ?
+                WHERE id = ?
+                """,
+                (PlanStatus.ARCHIVED.value, now, str(plan_id)),
+            )
+            connection.execute(
+                """
+                INSERT INTO audit_log
+                    (id, action, entity_type, entity_id, details_json, created_at)
+                VALUES (?, 'plan_archived', 'plan', ?, ?, ?)
+                """,
+                (
+                    str(uuid4()),
+                    str(plan_id),
+                    json.dumps(snapshot, ensure_ascii=False, sort_keys=True),
+                    now,
+                ),
+            )
+    def replace_take_profit_rules(
+        self,
+        plan_id: UUID,
+        take_profit_levels: tuple[TakeProfitLevel, ...],
+        recovery_levels: tuple[RecoveryLevel, ...],
+    ) -> None:
+        for level in take_profit_levels:
+            level.validate()
+        for level in recovery_levels:
+            level.validate()
+        if len({level.profit_rate for level in take_profit_levels}) != len(take_profit_levels):
+            raise ValueError("take-profit rates must be unique")
+        if len({level.drawdown for level in recovery_levels}) != len(recovery_levels):
+            raise ValueError("recovery drawdowns must be unique")
+        now = utc_now_text()
+        with self.transaction() as connection:
+            if connection.execute(
+                "SELECT 1 FROM plans WHERE id = ?", (str(plan_id),)
+            ).fetchone() is None:
+                raise KeyError("plan not found")
+            connection.execute(
+                "UPDATE take_profit_levels SET enabled = 0 WHERE plan_id = ?",
+                (str(plan_id),),
+            )
+            for position, level in enumerate(
+                sorted(take_profit_levels, key=lambda item: item.profit_rate)
+            ):
+                existing = connection.execute(
+                    """
+                    SELECT id FROM take_profit_levels
+                    WHERE plan_id = ? AND profit_rate = ?
+                    """,
+                    (str(plan_id), str(level.profit_rate)),
+                ).fetchone()
+                level_id = existing["id"] if existing else str(level.id)
+                connection.execute(
+                    """
+                    INSERT INTO take_profit_levels (
+                        id, plan_id, profit_rate, sell_ratio, sell_all,
+                        next_recurring_amount, enabled, position, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(plan_id, profit_rate) DO UPDATE SET
+                        sell_ratio = excluded.sell_ratio,
+                        sell_all = excluded.sell_all,
+                        next_recurring_amount = excluded.next_recurring_amount,
+                        enabled = excluded.enabled,
+                        position = excluded.position
+                    """,
+                    (
+                        level_id, str(plan_id), str(level.profit_rate),
+                        str(level.sell_ratio), int(level.sell_all),
+                        str(level.next_recurring_amount), int(level.enabled), position, now,
+                    ),
+                )
+            connection.execute(
+                "UPDATE recovery_levels SET enabled = 0 WHERE plan_id = ?",
+                (str(plan_id),),
+            )
+            for position, level in enumerate(
+                sorted(recovery_levels, key=lambda item: item.drawdown)
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO recovery_levels (
+                        id, plan_id, drawdown, recurring_amount, enabled, position, created_at
+                    ) VALUES (?, ?, ?, ?, 1, ?, ?)
+                    ON CONFLICT(plan_id, drawdown) DO UPDATE SET
+                        recurring_amount = excluded.recurring_amount,
+                        enabled = 1,
+                        position = excluded.position
+                    """,
+                    (
+                        str(level.id), str(plan_id), str(level.drawdown),
+                        (
+                            str(level.recurring_amount)
+                            if level.recurring_amount is not None else None
+                        ),
+                        position, now,
+                    ),
+                )
+            connection.execute(
+                """
+                INSERT INTO audit_log
+                    (id, action, entity_type, entity_id, details_json, created_at)
+                VALUES (?, 'take_profit_rules_updated', 'plan', ?, ?, ?)
+                """,
+                (
+                    str(uuid4()),
+                    str(plan_id),
+                    json.dumps(
+                        {
+                            "take_profit_levels": [
+                                {
+                                    "profit_rate": str(level.profit_rate),
+                                    "sell_ratio": str(level.sell_ratio),
+                                    "sell_all": level.sell_all,
+                                    "next_recurring_amount": str(
+                                        level.next_recurring_amount
+                                    ),
+                                }
+                                for level in take_profit_levels
+                            ],
+                            "recovery_levels": [
+                                {
+                                    "drawdown": str(level.drawdown),
+                                    "recurring_amount": (
+                                        str(level.recurring_amount)
+                                        if level.recurring_amount is not None else None
+                                    ),
+                                }
+                                for level in recovery_levels
+                            ],
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    now,
+                ),
+            )
+            version = connection.execute(
+                """
+                SELECT COALESCE(MAX(version), 0) + 1
+                FROM plan_configuration_versions WHERE plan_id = ?
+                """,
+                (str(plan_id),),
+            ).fetchone()[0]
+            plan = connection.execute(
+                "SELECT * FROM plans WHERE id = ?", (str(plan_id),)
+            ).fetchone()
+            connection.execute(
+                """
+                INSERT INTO plan_configuration_versions
+                    (id, plan_id, version, snapshot_json, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid4()), str(plan_id), version,
+                    json.dumps(
+                        {
+                            "base_amount": plan["base_amount"],
+                            "current_amount": plan["current_amount"],
+                            "take_profit_levels": [
+                                {
+                                    "profit_rate": str(level.profit_rate),
+                                    "sell_ratio": str(level.sell_ratio),
+                                    "sell_all": level.sell_all,
+                                    "next_recurring_amount": str(
+                                        level.next_recurring_amount
+                                    ),
+                                }
+                                for level in take_profit_levels
+                            ],
+                            "recovery_levels": [
+                                {
+                                    "drawdown": str(level.drawdown),
+                                    "recurring_amount": (
+                                        str(level.recurring_amount)
+                                        if level.recurring_amount is not None else None
+                                    ),
+                                }
+                                for level in recovery_levels
+                            ],
+                        },
+                        sort_keys=True,
+                    ),
+                    now,
+                ),
+            )
+
+    def take_profit_levels(self, plan_id: UUID) -> tuple[TakeProfitLevel, ...]:
+        with self.read() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM take_profit_levels
+                WHERE plan_id = ? AND enabled = 1
+                ORDER BY position, CAST(profit_rate AS NUMERIC)
+                """,
+                (str(plan_id),),
+            ).fetchall()
+        return tuple(
+            TakeProfitLevel(
+                id=UUID(row["id"]),
+                profit_rate=Decimal(row["profit_rate"]),
+                sell_ratio=Decimal(row["sell_ratio"]),
+                sell_all=bool(row["sell_all"]),
+                next_recurring_amount=Decimal(row["next_recurring_amount"]),
+                enabled=bool(row["enabled"]),
+                position=row["position"],
+            )
+            for row in rows
+        )
+
+    def recovery_levels(self, plan_id: UUID) -> tuple[RecoveryLevel, ...]:
+        with self.read() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM recovery_levels
+                WHERE plan_id = ? AND enabled = 1
+                ORDER BY position, CAST(drawdown AS NUMERIC)
+                """,
+                (str(plan_id),),
+            ).fetchall()
+        return tuple(
+            RecoveryLevel(
+                id=UUID(row["id"]),
+                drawdown=Decimal(row["drawdown"]),
+                recurring_amount=(
+                    Decimal(row["recurring_amount"])
+                    if row["recurring_amount"] is not None else None
+                ),
+                position=row["position"],
+            )
+            for row in rows
+        )
+
+    def current_take_profit_cycle(self, plan_id: UUID) -> sqlite3.Row | None:
+        with self.read() as connection:
+            return connection.execute(
+                """
+                SELECT * FROM take_profit_cycles
+                WHERE plan_id = ? AND state IN ('preparing', 'active', 'recovering')
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (str(plan_id),),
+            ).fetchone()
+
+    def save_take_profit_basis(
+        self,
+        plan_id: UUID,
+        *,
+        actual_units: Decimal,
+        cost_basis: Decimal,
+        lock: bool,
+        confirm_correction: bool = False,
+        previous_official_nav: Decimal | None = None,
+        previous_official_nav_date: date | None = None,
+        valuation_type: ValuationType = ValuationType.STANDARD,
+    ) -> UUID:
+        if actual_units < 0 or cost_basis <= 0:
+            raise ValueError("actual units cannot be negative and cost basis must be positive")
+        if (previous_official_nav is None) != (previous_official_nav_date is None):
+            raise ValueError("官方净值与净值日期必须同时填写")
+        if previous_official_nav is not None and previous_official_nav <= 0:
+            raise ValueError("上一期场外官方净值必须大于 0")
+        if previous_official_nav_date and previous_official_nav_date > date.today():
+            raise ValueError("官方净值日期不能晚于今天")
+        if lock and previous_official_nav is None:
+            raise ValueError("锁定止盈监控前请填写上一期场外官方净值和日期")
+        now = utc_now_text()
+        with self.transaction() as connection:
+            cycle = connection.execute(
+                """
+                SELECT * FROM take_profit_cycles
+                WHERE plan_id = ? AND state IN ('preparing', 'active', 'recovering')
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (str(plan_id),),
+            ).fetchone()
+            if cycle is None:
+                cycle_id = uuid4()
+                connection.execute(
+                    """
+                    INSERT INTO take_profit_cycles (
+                        id, plan_id, cost_basis, actual_units, basis_status,
+                        effective_date, previous_official_nav,
+                        previous_official_nav_date, valuation_type,
+                        basis_review_status, state, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'preparing', ?, ?)
+                    """,
+                    (
+                        str(cycle_id), str(plan_id), str(cost_basis), str(actual_units),
+                        (
+                            TakeProfitBasisStatus.LOCKED.value
+                            if lock else TakeProfitBasisStatus.DRAFT.value
+                        ),
+                        date.today().isoformat() if lock else None,
+                        (
+                            str(previous_official_nav)
+                            if previous_official_nav is not None else None
+                        ),
+                        (
+                            previous_official_nav_date.isoformat()
+                            if previous_official_nav_date else None
+                        ),
+                        valuation_type.value,
+                        "confirmed" if previous_official_nav is not None else "needs_review",
+                        now, now,
+                    ),
+                )
+                old = None
+            else:
+                cycle_id = UUID(cycle["id"])
+                if cycle["basis_status"] == TakeProfitBasisStatus.SUPERSEDED.value:
+                    raise ValueError("completed basis cannot be edited during recovery")
+                locked = cycle["basis_status"] == TakeProfitBasisStatus.LOCKED.value
+                basis_changed = (
+                    locked and Decimal(cycle["cost_basis"]) != cost_basis
+                )
+                if basis_changed and not confirm_correction:
+                    raise ValueError("locked basis requires confirmed correction")
+                old = {
+                    "cost_basis": cycle["cost_basis"],
+                    "actual_units": cycle["actual_units"],
+                    "basis_status": cycle["basis_status"],
+                    "previous_official_nav": cycle["previous_official_nav"],
+                    "previous_official_nav_date": cycle["previous_official_nav_date"],
+                    "valuation_type": cycle["valuation_type"],
+                }
+                connection.execute(
+                    """
+                    UPDATE take_profit_cycles
+                    SET cost_basis = ?, actual_units = ?, basis_status = ?,
+                        previous_official_nav = ?,
+                        previous_official_nav_date = ?,
+                        valuation_type = ?,
+                        basis_review_status = ?,
+                        effective_date = CASE
+                            WHEN ? = 'locked' THEN COALESCE(effective_date, ?)
+                            ELSE NULL
+                        END,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        str(cost_basis), str(actual_units),
+                        (
+                            TakeProfitBasisStatus.LOCKED.value
+                            if lock or locked else TakeProfitBasisStatus.DRAFT.value
+                        ),
+                        (
+                            str(previous_official_nav)
+                            if previous_official_nav is not None
+                            else cycle["previous_official_nav"]
+                        ),
+                        (
+                            previous_official_nav_date.isoformat()
+                            if previous_official_nav_date
+                            else cycle["previous_official_nav_date"]
+                        ),
+                        valuation_type.value,
+                        (
+                            "confirmed"
+                            if previous_official_nav is not None
+                            or cycle["previous_official_nav"] is not None
+                            else "needs_review"
+                        ),
+                        (
+                            TakeProfitBasisStatus.LOCKED.value
+                            if lock or locked else TakeProfitBasisStatus.DRAFT.value
+                        ),
+                        date.today().isoformat(), now, str(cycle_id),
+                    ),
+                )
+            connection.execute(
+                """
+                INSERT INTO audit_log
+                    (id, action, entity_type, entity_id, details_json, created_at)
+                VALUES (?, ?, 'take_profit_cycle', ?, ?, ?)
+                """,
+                (
+                    str(uuid4()),
+                    (
+                        "take_profit_basis_corrected"
+                        if old and basis_changed
+                        else "take_profit_holdings_updated"
+                        if old
+                        else "take_profit_basis_saved"
+                    ),
+                    str(cycle_id),
+                    json.dumps(
+                        {
+                            "old": old,
+                            "new": {
+                                "cost_basis": str(cost_basis),
+                                "actual_units": str(actual_units),
+                                "previous_official_nav": (
+                                    str(previous_official_nav)
+                                    if previous_official_nav is not None else None
+                                ),
+                                "previous_official_nav_date": (
+                                    previous_official_nav_date.isoformat()
+                                    if previous_official_nav_date else None
+                                ),
+                                "valuation_type": valuation_type.value,
+                                "basis_status": (
+                                    TakeProfitBasisStatus.LOCKED.value
+                                    if lock or (old and old["basis_status"] == "locked")
+                                    else TakeProfitBasisStatus.DRAFT.value
+                                ),
+                            },
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    now,
+                ),
+            )
+        return cycle_id
+
+    def record_official_nav(
+        self, plan_id: UUID, *, nav_date: date, official_nav: Decimal
+    ) -> int:
+        if official_nav <= 0:
+            raise ValueError("官方净值必须大于 0")
+        if nav_date > date.today():
+            raise ValueError("官方净值日期不能晚于今天")
+        now = utc_now_text()
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO fund_nav_records (
+                    id, plan_id, nav_date, official_nav, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(plan_id, nav_date) DO UPDATE SET
+                    official_nav = excluded.official_nav,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    str(uuid4()), str(plan_id), nav_date.isoformat(),
+                    str(official_nav), now, now,
+                ),
+            )
+            rows = connection.execute(
+                """
+                SELECT id, take_profit_target_price FROM events
+                WHERE plan_id = ? AND trading_date = ?
+                  AND event_type = 'take_profit'
+                """,
+                (str(plan_id), nav_date.isoformat()),
+            ).fetchall()
+            for row in rows:
+                status = (
+                    ValuationStatus.NAV_CONFIRMED
+                    if official_nav >= Decimal(row["take_profit_target_price"])
+                    else ValuationStatus.NAV_NOT_REACHED
+                )
+                connection.execute(
+                    """
+                    UPDATE events
+                    SET valuation_status = ?, official_nav = ?,
+                        official_nav_date = ?, reconciled_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        status.value, str(official_nav), nav_date.isoformat(),
+                        now, now, row["id"],
+                    ),
+                )
+            connection.execute(
+                """
+                UPDATE take_profit_cycles
+                SET previous_official_nav = ?,
+                    previous_official_nav_date = ?,
+                    basis_review_status = 'confirmed',
+                    updated_at = ?
+                WHERE plan_id = ?
+                  AND state IN ('preparing', 'active', 'recovering')
+                """,
+                (str(official_nav), nav_date.isoformat(), now, str(plan_id)),
+            )
+            connection.execute(
+                """
+                INSERT INTO audit_log
+                    (id, action, entity_type, entity_id, details_json, created_at)
+                VALUES (?, 'official_nav_recorded', 'plan', ?, ?, ?)
+                """,
+                (
+                    str(uuid4()), str(plan_id),
+                    json.dumps(
+                        {
+                            "nav_date": nav_date.isoformat(),
+                            "official_nav": str(official_nav),
+                            "reconciled_events": len(rows),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    now,
+                ),
+            )
+        return len(rows)
+
+    def latest_official_nav(self, plan_id: UUID) -> sqlite3.Row | None:
+        with self.read() as connection:
+            return connection.execute(
+                """
+                SELECT * FROM fund_nav_records
+                WHERE plan_id = ? ORDER BY nav_date DESC LIMIT 1
+                """,
+                (str(plan_id),),
+            ).fetchone()
+
+    def executed_take_profit_level_ids(self, cycle_id: UUID) -> set[UUID]:
+        with self.read() as connection:
+            rows = connection.execute(
+                "SELECT level_id FROM take_profit_executions WHERE cycle_id = ?",
+                (str(cycle_id),),
+            ).fetchall()
+        return {UUID(row["level_id"]) for row in rows}
+
+    def executed_recovery_level_ids(self, cycle_id: UUID) -> set[UUID]:
+        with self.read() as connection:
+            rows = connection.execute(
+                "SELECT level_id FROM recovery_executions WHERE cycle_id = ?",
+                (str(cycle_id),),
+            ).fetchall()
+        return {UUID(row["level_id"]) for row in rows}
+
+    def update_take_profit_peak(
+        self, cycle_id: UUID, price: Decimal, trading_date: date
+    ) -> Decimal:
+        with self.transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT take_profit_peak, take_profit_peak_date
+                FROM take_profit_cycles WHERE id = ?
+                """,
+                (str(cycle_id),),
+            ).fetchone()
+            if row is None:
+                raise KeyError("take-profit cycle not found")
+            peak = max(
+                price,
+                Decimal(row["take_profit_peak"])
+                if row["take_profit_peak"] is not None else price,
+            )
+            connection.execute(
+                """
+                UPDATE take_profit_cycles
+                SET take_profit_peak = ?,
+                    take_profit_peak_date = CASE
+                        WHEN take_profit_peak IS NULL
+                          OR CAST(take_profit_peak AS NUMERIC) < CAST(? AS NUMERIC)
+                        THEN ?
+                        ELSE take_profit_peak_date
+                    END,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    str(peak), str(price), trading_date.isoformat(),
+                    utc_now_text(), str(cycle_id),
+                ),
+            )
+        return peak
+
+    def confirm_take_profit_execution(
+        self,
+        event_id: UUID,
+        *,
+        actual_sell_units: Decimal,
+        executed_at: datetime | None = None,
+    ) -> None:
+        if actual_sell_units < 0:
+            raise ValueError("actual sell units cannot be negative")
+        now = utc_now_text()
+        execution_time = (executed_at or datetime.now().astimezone()).isoformat(
+            timespec="seconds"
+        )
+        with self.transaction() as connection:
+            event = connection.execute(
+                "SELECT * FROM events WHERE id = ?", (str(event_id),)
+            ).fetchone()
+            if event is None or event["event_type"] != "take_profit":
+                raise ValueError("event is not a take-profit event")
+            if event["execution_status"] == ExecutionStatus.EXECUTED.value:
+                raise ValueError("take-profit event was already executed")
+            cycle = connection.execute(
+                "SELECT * FROM take_profit_cycles WHERE id = ?",
+                (event["take_profit_cycle_id"],),
+            ).fetchone()
+            level = connection.execute(
+                "SELECT * FROM take_profit_levels WHERE id = ?",
+                (event["take_profit_level_id"],),
+            ).fetchone()
+            if cycle is None or level is None:
+                raise RuntimeError("take-profit snapshot is incomplete")
+            holdings = Decimal(cycle["actual_units"])
+            if actual_sell_units > holdings:
+                raise ValueError("actual sell units cannot exceed current holdings")
+            if bool(level["sell_all"]) and actual_sell_units != holdings:
+                raise ValueError("final take-profit level must sell all current holdings")
+            before = Decimal(event["recurring_amount_before"])
+            after = Decimal(level["next_recurring_amount"])
+            remaining = holdings - actual_sell_units
+            peak = max(
+                Decimal(event["quote_price"]),
+                Decimal(cycle["take_profit_peak"])
+                if cycle["take_profit_peak"] is not None else Decimal("0"),
+            )
+            connection.execute(
+                """
+                INSERT INTO take_profit_executions (
+                    id, cycle_id, level_id, event_id, actual_sell_units, quote_price,
+                    recurring_amount_before, recurring_amount_after, executed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid4()), cycle["id"], level["id"], str(event_id),
+                    str(actual_sell_units), event["quote_price"], str(before), str(after),
+                    execution_time,
+                ),
+            )
+            final = bool(level["sell_all"])
+            connection.execute(
+                """
+                UPDATE take_profit_cycles
+                SET actual_units = ?, take_profit_peak = ?,
+                    take_profit_peak_date = ?,
+                    basis_status = ?, state = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    str(remaining), str(peak), event["trading_date"],
+                    (
+                        TakeProfitBasisStatus.SUPERSEDED.value
+                        if final else TakeProfitBasisStatus.LOCKED.value
+                    ),
+                    "recovering" if final else "active",
+                    now, cycle["id"],
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE events
+                SET execution_status = ?, actual_sell_units = ?, executed_at = ?,
+                    recurring_amount_after = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    ExecutionStatus.EXECUTED.value, str(actual_sell_units),
+                    execution_time, str(after), now, str(event_id),
+                ),
+            )
+            connection.execute(
+                "UPDATE plans SET current_amount = ?, updated_at = ? WHERE id = ?",
+                (str(after), now, event["plan_id"]),
+            )
+            connection.execute(
+                """
+                UPDATE drawdown_cycles
+                SET state = 'closed_by_take_profit', ended_at = ?
+                WHERE plan_id = ? AND state = 'active'
+                """,
+                (now, event["plan_id"]),
+            )
+            connection.execute(
+                """
+                INSERT INTO audit_log
+                    (id, action, entity_type, entity_id, details_json, created_at)
+                VALUES (?, 'take_profit_executed', 'event', ?, ?, ?)
+                """,
+                (
+                    str(uuid4()), str(event_id),
+                    json.dumps(
+                        {
+                            "actual_sell_units": str(actual_sell_units),
+                            "holdings_before": str(holdings),
+                            "holdings_after": str(remaining),
+                            "recurring_amount_before": str(before),
+                            "recurring_amount_after": str(after),
+                            "take_profit_peak": str(peak),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    now,
+                ),
+            )
+
+    def apply_recovery(
+        self,
+        *,
+        cycle_id: UUID,
+        level_id: UUID,
+        event_id: UUID,
+        recurring_amount: Decimal,
+    ) -> None:
+        now = utc_now_text()
+        with self.transaction() as connection:
+            cycle = connection.execute(
+                "SELECT * FROM take_profit_cycles WHERE id = ?", (str(cycle_id),)
+            ).fetchone()
+            if cycle is None:
+                raise KeyError("take-profit cycle not found")
+            plan = connection.execute(
+                "SELECT current_amount, base_amount FROM plans WHERE id = ?",
+                (cycle["plan_id"],),
+            ).fetchone()
+            if plan is None:
+                raise KeyError("plan not found")
+            before = Decimal(plan["current_amount"])
+            connection.execute(
+                """
+                INSERT INTO recovery_executions (
+                    id, cycle_id, level_id, event_id, recurring_amount_before,
+                    recurring_amount_after, triggered_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid4()), str(cycle_id), str(level_id), str(event_id),
+                    str(before), str(recurring_amount), now,
+                ),
+            )
+            connection.execute(
+                "UPDATE plans SET current_amount = ?, updated_at = ? WHERE id = ?",
+                (str(recurring_amount), now, cycle["plan_id"]),
+            )
+            if (
+                recurring_amount >= Decimal(plan["base_amount"])
+                and cycle["state"] == "recovering"
+            ):
+                connection.execute(
+                    "UPDATE take_profit_cycles SET state = 'completed', updated_at = ? WHERE id = ?",
+                    (now, str(cycle_id)),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO take_profit_cycles (
+                        id, plan_id, actual_units, basis_status, state, created_at, updated_at
+                    ) VALUES (?, ?, '0', 'draft', 'preparing', ?, ?)
+                    """,
+                    (str(uuid4()), cycle["plan_id"], now, now),
+                )
+
+    def create_daily_summary(
+        self,
+        *,
+        check_run_id: UUID | None,
+        trading_date: date,
+        recipient: str,
+        subject: str,
+        body: str,
+        snapshot: dict[str, object],
+    ) -> tuple[UUID, bool]:
+        summary_id = uuid4()
+        now = utc_now_text()
+        with self.transaction() as connection:
+            existing = connection.execute(
+                """
+                SELECT id FROM daily_summaries
+                WHERE trading_date = ? AND scheduled_check = 1 AND email_recipient = ?
+                """,
+                (trading_date.isoformat(), recipient),
+            ).fetchone()
+            if existing:
+                return UUID(existing["id"]), False
+            connection.execute(
+                """
+                INSERT INTO daily_summaries (
+                    id, check_run_id, trading_date, scheduled_check, email_recipient,
+                    subject, body, snapshot_json, state, created_at, updated_at
+                ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, 'daily_summary_pending', ?, ?)
+                """,
+                (
+                    str(summary_id), str(check_run_id) if check_run_id else None,
+                    trading_date.isoformat(), recipient, subject, body,
+                    json.dumps(snapshot, ensure_ascii=False, sort_keys=True), now, now,
+                ),
+            )
+        return summary_id, True
+
+    def daily_summary_row(self, summary_id: UUID) -> sqlite3.Row:
+        with self.read() as connection:
+            row = connection.execute(
+                "SELECT * FROM daily_summaries WHERE id = ?", (str(summary_id),)
+            ).fetchone()
+        if row is None:
+            raise KeyError("daily summary not found")
+        return row
+
+    def mark_daily_summary(
+        self, summary_id: UUID, *, sent: bool, error_summary: str | None = None
+    ) -> None:
+        now = utc_now_text()
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE daily_summaries
+                SET state = ?, attempts = attempts + 1, attempted_at = ?,
+                    sent_at = CASE WHEN ? THEN ? ELSE sent_at END,
+                    error_summary = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    "daily_summary_sent" if sent else "daily_summary_failed",
+                    now, int(sent), now, error_summary, now, str(summary_id),
+                ),
+            )
+
+    def mark_events_from_daily_summary(
+        self, event_ids: tuple[UUID, ...], *, sent: bool
+    ) -> None:
+        if not event_ids:
+            return
+        next_state = (
+            EventState.NOTIFIED.value if sent else EventState.DELIVERY_FAILED.value
+        )
+        now = utc_now_text()
+        with self.transaction() as connection:
+            for event_id in event_ids:
+                connection.execute(
+                    """
+                    UPDATE events
+                    SET state = CASE
+                            WHEN state = ? THEN state
+                            WHEN ? = ? AND EXISTS (
+                                SELECT 1 FROM notification_deliveries d
+                                WHERE d.event_id = events.id AND d.state = ?
+                            ) THEN ?
+                            ELSE ?
+                        END,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        EventState.SUPPRESSED.value,
+                        next_state,
+                        EventState.DELIVERY_FAILED.value,
+                        DeliveryState.SENT.value,
+                        EventState.NOTIFIED.value,
+                        next_state,
+                        now,
+                        str(event_id),
+                    ),
                 )
 
     def update_event_action(

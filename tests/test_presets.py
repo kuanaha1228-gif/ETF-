@@ -4,7 +4,11 @@ from pathlib import Path
 from unittest import TestCase
 
 from etf_assistant.db import Database
-from etf_assistant.presets import PRD_PLAN_PRESETS, install_prd_plan_presets
+from etf_assistant.presets import (
+    PRD_PLAN_PRESETS,
+    install_prd_plan_presets,
+    install_v17_take_profit_rules,
+)
 
 
 class PresetTests(TestCase):
@@ -20,10 +24,10 @@ class PresetTests(TestCase):
             self.assertEqual(
                 [(plan.purchase_code, plan.signal_code, plan.base_amount) for plan in plans],
                 [
-                    ("022459", "159361", Decimal("600")),
+                    ("022459", "159361", Decimal("300")),
                     ("019632", "159516", Decimal("250")),
-                    ("019666", "516080", Decimal("200")),
-                    ("014415", "516670", Decimal("300")),
+                    ("019666", "516080", Decimal("300")),
+                    ("014415", "516670", Decimal("100")),
                 ],
             )
             expected = {
@@ -38,3 +42,23 @@ class PresetTests(TestCase):
                     tuple(str(level.threshold) for level in strategy.levels),
                     expected[plan.signal_code],
                 )
+            self.assertEqual(install_v17_take_profit_rules(database), 3)
+            self.assertEqual(install_v17_take_profit_rules(database), 0)
+            by_signal = {plan.signal_code: plan for plan in plans}
+            innovation_recovery = database.recovery_levels(
+                by_signal["516080"].id
+            )
+            self.assertEqual(
+                [
+                    (level.drawdown, level.recurring_amount)
+                    for level in innovation_recovery
+                ],
+                [
+                    (Decimal("10"), Decimal("150")),
+                    (Decimal("20"), Decimal("300")),
+                ],
+            )
+            self.assertEqual(
+                database.recovery_levels(by_signal["516670"].id),
+                (),
+            )
