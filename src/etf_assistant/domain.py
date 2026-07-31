@@ -187,6 +187,16 @@ class Quote:
 
 
 @dataclass(frozen=True, slots=True)
+class FundNav:
+    symbol: str
+    nav_date: date
+    unit_nav: Decimal
+    daily_change: Decimal | None
+    source: str
+    fetched_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class TriggerDecision:
     level: StrategyLevel | None
     drawdown: Decimal

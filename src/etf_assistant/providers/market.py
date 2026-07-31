@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Protocol
+from urllib.request import Request, urlopen
 
-from ..domain import DatedClose, Quote
+from ..domain import DatedClose, FundNav, Quote
 
 
 _SPLIT_FACTORS = tuple(Decimal(value) for value in ("0.2", "0.25", "0.333333", "0.5", "2", "3", "4", "5", "10"))
@@ -58,6 +61,60 @@ class MarketProvider(Protocol):
 
 class TradingCalendar(Protocol):
     def is_trading_day(self, value: date) -> bool: ...
+
+
+class FundNavProvider(Protocol):
+    def latest_nav(self, symbol: str) -> FundNav: ...
+
+
+def _parse_eastmoney_nav_script(
+    symbol: str, payload: str, fetched_at: datetime
+) -> FundNav:
+    match = re.search(r"var\s+Data_netWorthTrend\s*=\s*(\[.*?\]);", payload, re.S)
+    if match is None:
+        raise RuntimeError("天天基金返回中缺少历史净值数据")
+    rows = json.loads(match.group(1))
+    if not rows:
+        raise RuntimeError("天天基金尚未公布该基金净值")
+    latest = rows[-1]
+    timestamp = int(latest["x"]) / 1000
+    nav_date = datetime.fromtimestamp(timestamp).astimezone().date()
+    unit_nav = Decimal(str(latest["y"]))
+    daily_change = latest.get("equityReturn")
+    if unit_nav <= 0:
+        raise RuntimeError("天天基金返回了无效单位净值")
+    return FundNav(
+        symbol=symbol,
+        nav_date=nav_date,
+        unit_nav=unit_nav,
+        daily_change=(
+            Decimal(str(daily_change)) if daily_change is not None else None
+        ),
+        source="eastmoney",
+        fetched_at=fetched_at,
+    )
+
+
+class EastmoneyFundNavProvider:
+    """Read the latest published off-exchange NAV without account credentials."""
+
+    def latest_nav(self, symbol: str) -> FundNav:
+        if len(symbol) != 6 or not symbol.isdigit():
+            raise ValueError("场外基金代码必须是 6 位数字")
+        fetched_at = datetime.now().astimezone()
+        request = Request(
+            f"https://fund.eastmoney.com/pingzhongdata/{symbol}.js",
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 Chrome/126 Safari/537.36"
+                ),
+                "Referer": f"https://fund.eastmoney.com/{symbol}.html",
+            },
+        )
+        with urlopen(request, timeout=15) as response:
+            payload = response.read().decode("utf-8", errors="replace")
+        return _parse_eastmoney_nav_script(symbol, payload, fetched_at)
 
 
 class WeekdayCalendar:

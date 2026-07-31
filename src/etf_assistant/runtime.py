@@ -10,7 +10,11 @@ from zoneinfo import ZoneInfo
 from .config import app_data_dir
 from .db import Database
 from .providers.credentials import CredentialStore, LocalCredentialStore
-from .providers.market import AkshareMarketProvider, AkshareTradingCalendar
+from .providers.market import (
+    AkshareMarketProvider,
+    AkshareTradingCalendar,
+    EastmoneyFundNavProvider,
+)
 from .providers.notify import (
     NotificationProvider,
     SmtpEmailNotifier,
@@ -148,6 +152,7 @@ def run_daily_check(
                 market=AkshareMarketProvider(),
                 calendar=AkshareTradingCalendar(),
                 notifiers=build_notifiers(database, credentials),
+                fund_nav_provider=EastmoneyFundNavProvider(),
             )
             result = service.run(
                 now,

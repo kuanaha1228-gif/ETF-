@@ -26,6 +26,7 @@ from .domain import (
 )
 from .presets import install_prd_plan_presets, install_v17_take_profit_rules
 from .providers.credentials import LocalCredentialStore
+from .providers.market import EastmoneyFundNavProvider
 from .providers.notify import SmtpEmailNotifier
 from .scheduler import ensure_scheduler
 from .strategy import STRATEGY_TEMPLATES, default_strategy, take_profit_target
@@ -93,6 +94,9 @@ def _plan_payload(database: Database, plan: Plan) -> dict[str, object]:
     strategy = database.get_active_strategy(plan.id)
     cycle = database.get_active_cycle(plan.id)
     take_profit_cycle = database.current_take_profit_cycle(plan.id)
+    position = database.current_position(plan.id)
+    latest_nav = database.latest_official_nav(plan.id)
+    holding_transactions = database.holding_transactions(plan.id)
     take_profit_levels = database.take_profit_levels(plan.id)
     recovery_levels = database.recovery_levels(plan.id)
     executed_take_profit = (
@@ -117,12 +121,11 @@ def _plan_payload(database: Database, plan: Plan) -> dict[str, object]:
         "cyclePeak": cycle["cycle_peak"] if cycle else None,
         "takeProfit": {
             "cycleId": take_profit_cycle["id"] if take_profit_cycle else None,
-            "costBasis": (
-                take_profit_cycle["cost_basis"] if take_profit_cycle else None
-            ),
-            "actualUnits": (
-                take_profit_cycle["actual_units"] if take_profit_cycle else "0"
-            ),
+            "costBasis": position["average_cost"],
+            "actualUnits": position["actual_units"],
+            "totalCost": position["total_cost"],
+            "positionUpdatedAt": position["updated_at"],
+            "positionReviewStatus": position["review_status"],
             "basisStatus": (
                 take_profit_cycle["basis_status"] if take_profit_cycle else "draft"
             ),
@@ -134,21 +137,33 @@ def _plan_payload(database: Database, plan: Plan) -> dict[str, object]:
             ),
             "state": take_profit_cycle["state"] if take_profit_cycle else "preparing",
             "previousOfficialNav": (
-                take_profit_cycle["previous_official_nav"]
-                if take_profit_cycle else None
+                latest_nav["official_nav"] if latest_nav else None
             ),
             "previousOfficialNavDate": (
-                take_profit_cycle["previous_official_nav_date"]
-                if take_profit_cycle else None
+                latest_nav["nav_date"] if latest_nav else None
             ),
+            "officialDailyChange": (
+                latest_nav["daily_change"] if latest_nav else None
+            ),
+            "officialNavSource": latest_nav["source"] if latest_nav else None,
             "valuationType": (
                 take_profit_cycle["valuation_type"]
                 if take_profit_cycle else ValuationType.STANDARD.value
             ),
-            "basisReviewStatus": (
-                take_profit_cycle["basis_review_status"]
-                if take_profit_cycle else "needs_review"
-            ),
+            "basisReviewStatus": position["review_status"],
+            "holdingTransactions": [
+                {
+                    "id": row["id"],
+                    "eventId": row["event_id"],
+                    "navDate": row["nav_date"],
+                    "grossAmount": row["gross_amount"],
+                    "feeAmount": row["fee_amount"],
+                    "officialNav": row["official_nav"],
+                    "units": row["units"],
+                    "status": row["status"],
+                }
+                for row in holding_transactions
+            ],
             "levels": [
                 {
                     "id": str(level.id),
@@ -159,12 +174,11 @@ def _plan_payload(database: Database, plan: Plan) -> dict[str, object]:
                     "targetPrice": (
                         str(
                             take_profit_target(
-                                Decimal(take_profit_cycle["cost_basis"]),
+                                Decimal(position["average_cost"]),
                                 level.profit_rate,
                             )
                         )
-                        if take_profit_cycle
-                        and take_profit_cycle["cost_basis"] is not None
+                        if position["average_cost"] is not None
                         else None
                     ),
                     "executed": level.id in executed_take_profit,
@@ -267,11 +281,13 @@ def main() -> int:
         stateChanged = QtCore.Signal()
         checkFinished = QtCore.Signal(str)
         chartLoaded = QtCore.Signal(str, str)
+        navSyncFinished = QtCore.Signal(str)
 
         def __init__(self) -> None:
             super().__init__()
             self._check_running = False
             self._chart_running: set[str] = set()
+            self._nav_sync_running: set[str] = set()
 
         @QtCore.Slot(result=str)
         def getState(self) -> str:
@@ -321,6 +337,7 @@ def main() -> int:
                             "executionStatus": row["execution_status"],
                             "executedAmount": row["executed_amount"],
                             "executedAt": row["executed_at"],
+                            "takeProfitCostBasis": row["take_profit_cost_basis"],
                             "takeProfitTargetPrice": row["take_profit_target_price"],
                             "sellRatio": row["sell_ratio_snapshot"],
                             "plannedSellUnits": row["planned_sell_units"],
@@ -336,6 +353,10 @@ def main() -> int:
                             "signalIntradayReturn": row["signal_intraday_return"],
                             "officialNav": row["official_nav"],
                             "officialNavDate": row["official_nav_date"],
+                            "holdingStatus": row["holding_status"],
+                            "holdingNavDate": row["holding_nav_date"],
+                            "holdingFeeAmount": row["holding_fee_amount"],
+                            "holdingUnits": row["holding_units"],
                         }
                         for row in events
                     ],
@@ -550,14 +571,14 @@ def main() -> int:
                         payload.get("actualUnits", ""), "当前实际持有份额"
                     ),
                     cost_basis=_decimal_input(
-                        payload.get("costBasis", ""), "本轮止盈基准成本"
+                        payload.get("costBasis", ""), "当前平均持仓成本"
                     ),
                     lock=lock,
                     confirm_correction=confirm_correction,
                     previous_official_nav=(
                         _decimal_input(
                             payload.get("previousOfficialNav", ""),
-                            "上一期场外官方净值",
+                            "场外官方净值",
                         )
                         if str(payload.get("previousOfficialNav", "")).strip()
                         else None
@@ -586,7 +607,7 @@ def main() -> int:
                     official_nav=_decimal_input(official_nav, "场外官方净值"),
                 )
                 self.stateChanged.emit()
-                return f"官方净值已保存，已复核 {reconciled} 条盘中止盈预警"
+                return f"官方净值已保存，已处理 {reconciled} 条待复核/待结算记录"
             except Exception as error:
                 return str(error)
 
@@ -664,6 +685,8 @@ def main() -> int:
             try:
                 if action == "executed":
                     row = database.event_row(UUID(event_id))
+                    if row["event_type"] in {"recurring", "drawdown", "combined"}:
+                        return "请使用“确认已投入”填写金额、费用和净值归属日"
                     database.update_event_action(
                         UUID(event_id),
                         execution_status=ExecutionStatus.EXECUTED,
@@ -682,6 +705,65 @@ def main() -> int:
                 return ""
             except Exception as error:
                 return str(error)
+
+        @QtCore.Slot(str, str, str, str, result=str)
+        def confirmInvestment(
+            self,
+            event_id: str,
+            gross_amount: str,
+            fee_amount: str,
+            nav_date: str,
+        ) -> str:
+            try:
+                status = database.confirm_investment(
+                    UUID(event_id),
+                    gross_amount=_decimal_input(gross_amount, "实际投入金额"),
+                    fee_amount=_decimal_input(fee_amount, "申购费用"),
+                    nav_date=date.fromisoformat(nav_date),
+                )
+                self.stateChanged.emit()
+                return (
+                    "已按对应日官方净值结算，持仓份额和平均成本已更新"
+                    if status == "settled"
+                    else "已确认投入；对应日官方净值尚未公布，当前等待净值结算"
+                )
+            except Exception as error:
+                return str(error)
+
+        @QtCore.Slot(str, result=str)
+        def syncFundNav(self, plan_id: str) -> str:
+            if plan_id in self._nav_sync_running:
+                return "busy"
+            self._nav_sync_running.add(plan_id)
+            threading.Thread(
+                target=self._sync_fund_nav,
+                args=(plan_id,),
+                daemon=True,
+            ).start()
+            return "started"
+
+        def _sync_fund_nav(self, plan_id: str) -> None:
+            try:
+                plan = database.get_plan(UUID(plan_id))
+                nav = EastmoneyFundNavProvider().latest_nav(plan.purchase_code)
+                affected = database.record_official_nav(
+                    plan.id,
+                    nav_date=nav.nav_date,
+                    official_nav=nav.unit_nav,
+                    daily_change=nav.daily_change,
+                    source=nav.source,
+                    fetched_at=nav.fetched_at,
+                )
+                self.stateChanged.emit()
+                message = (
+                    f"已同步 {nav.nav_date.isoformat()} 单位净值 {nav.unit_nav}"
+                    + (f"，并处理 {affected} 条待复核/待结算记录" if affected else "")
+                )
+            except Exception as error:
+                message = str(error)
+            finally:
+                self._nav_sync_running.discard(plan_id)
+            self.navSyncFinished.emit(message)
 
         @QtCore.Slot(result=str)
         def runCheck(self) -> str:

@@ -1,8 +1,13 @@
+from datetime import datetime, timezone
+from decimal import Decimal
 from unittest import TestCase
 
 import pandas as pd
 
-from etf_assistant.providers.market import AkshareMarketProvider
+from etf_assistant.providers.market import (
+    AkshareMarketProvider,
+    _parse_eastmoney_nav_script,
+)
 
 
 class _FakeAkshare:
@@ -23,6 +28,20 @@ class _FakeAkshare:
 
 
 class MarketProviderTests(TestCase):
+    def test_eastmoney_nav_script_returns_latest_official_nav(self) -> None:
+        payload = """
+        var Data_netWorthTrend = [
+          {"x":1785254400000,"y":1.0143,"equityReturn":-2.21},
+          {"x":1785340800000,"y":1.0253,"equityReturn":1.08}
+        ];
+        """
+        fetched_at = datetime(2026, 7, 30, 9, tzinfo=timezone.utc)
+        nav = _parse_eastmoney_nav_script("019666", payload, fetched_at)
+        self.assertEqual(nav.symbol, "019666")
+        self.assertEqual(nav.unit_nav, Decimal("1.0253"))
+        self.assertEqual(nav.daily_change, Decimal("1.08"))
+        self.assertEqual(nav.source, "eastmoney")
+
     def test_daily_candles_use_exchange_prefix_and_return_ohlc(self) -> None:
         provider = AkshareMarketProvider.__new__(AkshareMarketProvider)
         provider.ak = _FakeAkshare()

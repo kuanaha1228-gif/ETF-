@@ -28,7 +28,7 @@ from .domain import (
 )
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 SENSITIVE_SETTING_MARKERS = ("password", "secret", "token", "webhook", "authorization")
 
 
@@ -277,9 +277,37 @@ CREATE TABLE IF NOT EXISTS fund_nav_records (
     plan_id TEXT NOT NULL REFERENCES plans(id),
     nav_date TEXT NOT NULL,
     official_nav TEXT NOT NULL,
+    daily_change TEXT,
+    source TEXT NOT NULL DEFAULT 'manual',
+    fetched_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE(plan_id, nav_date)
+);
+
+CREATE TABLE IF NOT EXISTS portfolio_positions (
+    plan_id TEXT PRIMARY KEY REFERENCES plans(id),
+    actual_units TEXT NOT NULL DEFAULT '0',
+    total_cost TEXT NOT NULL DEFAULT '0',
+    average_cost TEXT,
+    review_status TEXT NOT NULL DEFAULT 'needs_review',
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS holding_transactions (
+    id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL REFERENCES plans(id),
+    event_id TEXT REFERENCES events(id),
+    transaction_type TEXT NOT NULL,
+    nav_date TEXT NOT NULL,
+    gross_amount TEXT NOT NULL,
+    fee_amount TEXT NOT NULL DEFAULT '0',
+    official_nav TEXT,
+    units TEXT,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    settled_at TEXT,
+    UNIQUE(event_id)
 );
 
 CREATE TABLE IF NOT EXISTS take_profit_executions (
@@ -580,6 +608,64 @@ class Database:
                             )
                     connection.executescript(SCHEMA_SQL)
                     connection.execute("PRAGMA user_version = 7")
+                if current < 8:
+                    nav_columns = {
+                        row["name"]
+                        for row in connection.execute(
+                            "PRAGMA table_info(fund_nav_records)"
+                        )
+                    }
+                    for column, definition in (
+                        ("daily_change", "TEXT"),
+                        ("source", "TEXT NOT NULL DEFAULT 'manual'"),
+                        ("fetched_at", "TEXT"),
+                    ):
+                        if column not in nav_columns:
+                            connection.execute(
+                                f"ALTER TABLE fund_nav_records ADD COLUMN {column} {definition}"
+                            )
+                    connection.executescript(SCHEMA_SQL)
+                    for plan_row in connection.execute("SELECT id FROM plans").fetchall():
+                        cycle = connection.execute(
+                            """
+                            SELECT cost_basis, actual_units, basis_review_status
+                            FROM take_profit_cycles
+                            WHERE plan_id = ?
+                              AND state IN ('preparing', 'active', 'recovering')
+                            ORDER BY created_at DESC LIMIT 1
+                            """,
+                            (plan_row["id"],),
+                        ).fetchone()
+                        units = (
+                            Decimal(cycle["actual_units"])
+                            if cycle and cycle["actual_units"] is not None
+                            else Decimal("0")
+                        )
+                        average = (
+                            Decimal(cycle["cost_basis"])
+                            if cycle and cycle["cost_basis"] is not None
+                            else None
+                        )
+                        connection.execute(
+                            """
+                            INSERT OR IGNORE INTO portfolio_positions (
+                                plan_id, actual_units, total_cost, average_cost,
+                                review_status, updated_at
+                            ) VALUES (?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                plan_row["id"],
+                                str(units),
+                                str(units * average) if average is not None else "0",
+                                str(average) if average is not None else None,
+                                (
+                                    cycle["basis_review_status"]
+                                    if cycle else "needs_review"
+                                ),
+                                utc_now_text(),
+                            ),
+                        )
+                    connection.execute("PRAGMA user_version = 8")
 
     def integrity_check(self) -> bool:
         with self.read() as connection:
@@ -608,6 +694,15 @@ class Database:
                     int(plan.drawdown_enabled), int(plan.enabled), plan.status.value,
                     str(strategy.id), now, now,
                 ),
+            )
+            connection.execute(
+                """
+                INSERT INTO portfolio_positions (
+                    plan_id, actual_units, total_cost, average_cost,
+                    review_status, updated_at
+                ) VALUES (?, '0', '0', NULL, 'needs_review', ?)
+                """,
+                (str(plan.id), now),
             )
             self._insert_strategy(connection, strategy)
             connection.execute(
@@ -757,9 +852,13 @@ class Database:
         with self.read() as connection:
             return connection.execute(
                 """
-                SELECT e.*, p.name AS plan_name, p.purchase_code, p.signal_code
+                SELECT e.*, p.name AS plan_name, p.purchase_code, p.signal_code,
+                       ht.status AS holding_status, ht.nav_date AS holding_nav_date,
+                       ht.fee_amount AS holding_fee_amount,
+                       ht.units AS holding_units
                 FROM events e
                 JOIN plans p ON p.id = e.plan_id
+                LEFT JOIN holding_transactions ht ON ht.event_id = e.id
                 ORDER BY e.created_at DESC
                 LIMIT ?
                 """,
@@ -1921,10 +2020,55 @@ class Database:
                     now,
                 ),
             )
+            total_cost = actual_units * cost_basis
+            if previous_official_nav is not None and previous_official_nav_date is not None:
+                connection.execute(
+                    """
+                    INSERT INTO fund_nav_records (
+                        id, plan_id, nav_date, official_nav, source,
+                        fetched_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 'manual', ?, ?, ?)
+                    ON CONFLICT(plan_id, nav_date) DO UPDATE SET
+                        official_nav = excluded.official_nav,
+                        source = excluded.source,
+                        fetched_at = excluded.fetched_at,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        str(uuid4()), str(plan_id),
+                        previous_official_nav_date.isoformat(),
+                        str(previous_official_nav), now, now, now,
+                    ),
+                )
+            connection.execute(
+                """
+                INSERT INTO portfolio_positions (
+                    plan_id, actual_units, total_cost, average_cost,
+                    review_status, updated_at
+                ) VALUES (?, ?, ?, ?, 'confirmed', ?)
+                ON CONFLICT(plan_id) DO UPDATE SET
+                    actual_units = excluded.actual_units,
+                    total_cost = excluded.total_cost,
+                    average_cost = excluded.average_cost,
+                    review_status = 'confirmed',
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    str(plan_id), str(actual_units), str(total_cost),
+                    str(cost_basis), now,
+                ),
+            )
         return cycle_id
 
     def record_official_nav(
-        self, plan_id: UUID, *, nav_date: date, official_nav: Decimal
+        self,
+        plan_id: UUID,
+        *,
+        nav_date: date,
+        official_nav: Decimal,
+        daily_change: Decimal | None = None,
+        source: str = "manual",
+        fetched_at: datetime | None = None,
     ) -> int:
         if official_nav <= 0:
             raise ValueError("官方净值必须大于 0")
@@ -1935,15 +2079,26 @@ class Database:
             connection.execute(
                 """
                 INSERT INTO fund_nav_records (
-                    id, plan_id, nav_date, official_nav, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    id, plan_id, nav_date, official_nav, daily_change,
+                    source, fetched_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(plan_id, nav_date) DO UPDATE SET
                     official_nav = excluded.official_nav,
+                    daily_change = excluded.daily_change,
+                    source = excluded.source,
+                    fetched_at = excluded.fetched_at,
                     updated_at = excluded.updated_at
                 """,
                 (
                     str(uuid4()), str(plan_id), nav_date.isoformat(),
-                    str(official_nav), now, now,
+                    str(official_nav),
+                    str(daily_change) if daily_change is not None else None,
+                    source,
+                    (
+                        fetched_at.isoformat(timespec="seconds")
+                        if fetched_at is not None else now
+                    ),
+                    now, now,
                 ),
             )
             rows = connection.execute(
@@ -2004,7 +2159,104 @@ class Database:
                     now,
                 ),
             )
-        return len(rows)
+            settled = self._settle_pending_investments(
+                connection, plan_id, nav_date, official_nav, now
+            )
+        return len(rows) + settled
+
+    def _settle_pending_investments(
+        self,
+        connection: sqlite3.Connection,
+        plan_id: UUID,
+        nav_date: date,
+        official_nav: Decimal,
+        now: str,
+    ) -> int:
+        pending = connection.execute(
+            """
+            SELECT * FROM holding_transactions
+            WHERE plan_id = ? AND nav_date = ? AND status = 'pending_nav'
+            ORDER BY created_at, id
+            """,
+            (str(plan_id), nav_date.isoformat()),
+        ).fetchall()
+        if not pending:
+            return 0
+        position = connection.execute(
+            "SELECT * FROM portfolio_positions WHERE plan_id = ?",
+            (str(plan_id),),
+        ).fetchone()
+        current_units = (
+            Decimal(position["actual_units"]) if position else Decimal("0")
+        )
+        total_cost = Decimal(position["total_cost"]) if position else Decimal("0")
+        for item in pending:
+            gross = Decimal(item["gross_amount"])
+            fee = Decimal(item["fee_amount"])
+            units = (gross - fee) / official_nav
+            current_units += units
+            total_cost += gross
+            average = total_cost / current_units
+            connection.execute(
+                """
+                UPDATE holding_transactions
+                SET official_nav = ?, units = ?, status = 'settled', settled_at = ?
+                WHERE id = ?
+                """,
+                (str(official_nav), str(units), now, item["id"]),
+            )
+            connection.execute(
+                """
+                INSERT INTO audit_log (
+                    id, action, entity_type, entity_id, details_json, created_at
+                ) VALUES (?, 'investment_settled', 'holding_transaction', ?, ?, ?)
+                """,
+                (
+                    str(uuid4()), item["id"],
+                    json.dumps(
+                        {
+                            "nav_date": nav_date.isoformat(),
+                            "official_nav": str(official_nav),
+                            "gross_amount": str(gross),
+                            "fee_amount": str(fee),
+                            "units": str(units),
+                            "average_cost_after": str(average),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    now,
+                ),
+            )
+        average = total_cost / current_units
+        connection.execute(
+            """
+            INSERT INTO portfolio_positions (
+                plan_id, actual_units, total_cost, average_cost,
+                review_status, updated_at
+            ) VALUES (?, ?, ?, ?, 'confirmed', ?)
+            ON CONFLICT(plan_id) DO UPDATE SET
+                actual_units = excluded.actual_units,
+                total_cost = excluded.total_cost,
+                average_cost = excluded.average_cost,
+                review_status = 'confirmed',
+                updated_at = excluded.updated_at
+            """,
+            (
+                str(plan_id), str(current_units), str(total_cost),
+                str(average), now,
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE take_profit_cycles
+            SET actual_units = ?, cost_basis = ?, updated_at = ?
+            WHERE plan_id = ?
+              AND state IN ('preparing', 'active', 'recovering')
+            """,
+            (str(current_units), str(average), now, str(plan_id)),
+        )
+        return len(pending)
 
     def latest_official_nav(self, plan_id: UUID) -> sqlite3.Row | None:
         with self.read() as connection:
@@ -2015,6 +2267,129 @@ class Database:
                 """,
                 (str(plan_id),),
             ).fetchone()
+
+    def current_position(self, plan_id: UUID) -> sqlite3.Row:
+        with self.read() as connection:
+            row = connection.execute(
+                "SELECT * FROM portfolio_positions WHERE plan_id = ?",
+                (str(plan_id),),
+            ).fetchone()
+        if row is None:
+            raise KeyError("portfolio position not found")
+        return row
+
+    def holding_transactions(
+        self, plan_id: UUID, limit: int = 20
+    ) -> list[sqlite3.Row]:
+        with self.read() as connection:
+            return connection.execute(
+                """
+                SELECT * FROM holding_transactions
+                WHERE plan_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (str(plan_id), limit),
+            ).fetchall()
+
+    def confirm_investment(
+        self,
+        event_id: UUID,
+        *,
+        gross_amount: Decimal,
+        fee_amount: Decimal,
+        nav_date: date,
+        executed_at: datetime | None = None,
+    ) -> str:
+        if gross_amount <= 0:
+            raise ValueError("实际投入金额必须大于 0")
+        if fee_amount < 0 or fee_amount >= gross_amount:
+            raise ValueError("申购费用必须大于等于 0 且小于实际投入金额")
+        if nav_date > date.today():
+            raise ValueError("净值归属日不能晚于今天")
+        now = utc_now_text()
+        execution_time = (executed_at or datetime.now().astimezone()).isoformat(
+            timespec="seconds"
+        )
+        with self.transaction() as connection:
+            event = connection.execute(
+                "SELECT * FROM events WHERE id = ?", (str(event_id),)
+            ).fetchone()
+            if event is None or event["event_type"] not in {
+                "recurring", "drawdown", "combined"
+            }:
+                raise ValueError("只有定投或补仓提醒可以确认投入")
+            existing = connection.execute(
+                "SELECT status FROM holding_transactions WHERE event_id = ?",
+                (str(event_id),),
+            ).fetchone()
+            if existing is not None:
+                raise ValueError("该提醒已经确认投入，不能重复增加持仓")
+            transaction_id = uuid4()
+            connection.execute(
+                """
+                INSERT INTO holding_transactions (
+                    id, plan_id, event_id, transaction_type, nav_date,
+                    gross_amount, fee_amount, status, created_at
+                ) VALUES (?, ?, ?, 'buy', ?, ?, ?, 'pending_nav', ?)
+                """,
+                (
+                    str(transaction_id), event["plan_id"], str(event_id),
+                    nav_date.isoformat(), str(gross_amount), str(fee_amount), now,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE events
+                SET execution_status = ?, executed_amount = ?, executed_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    ExecutionStatus.EXECUTED.value, str(gross_amount),
+                    execution_time, now, str(event_id),
+                ),
+            )
+            nav = connection.execute(
+                """
+                SELECT official_nav FROM fund_nav_records
+                WHERE plan_id = ? AND nav_date = ?
+                """,
+                (event["plan_id"], nav_date.isoformat()),
+            ).fetchone()
+            status = "pending_nav"
+            if nav is not None:
+                self._settle_pending_investments(
+                    connection,
+                    UUID(event["plan_id"]),
+                    nav_date,
+                    Decimal(nav["official_nav"]),
+                    now,
+                )
+                status = "settled"
+            connection.execute(
+                """
+                INSERT INTO audit_log (
+                    id, action, entity_type, entity_id, details_json, created_at
+                ) VALUES (?, 'investment_confirmed', 'event', ?, ?, ?)
+                """,
+                (
+                    str(uuid4()), str(event_id),
+                    json.dumps(
+                        {
+                            "transaction_id": str(transaction_id),
+                            "gross_amount": str(gross_amount),
+                            "fee_amount": str(fee_amount),
+                            "nav_date": nav_date.isoformat(),
+                            "status": status,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    now,
+                ),
+            )
+        return status
 
     def executed_take_profit_level_ids(self, cycle_id: UUID) -> set[UUID]:
         with self.read() as connection:
@@ -2101,7 +2476,23 @@ class Database:
             ).fetchone()
             if cycle is None or level is None:
                 raise RuntimeError("take-profit snapshot is incomplete")
-            holdings = Decimal(cycle["actual_units"])
+            position = connection.execute(
+                "SELECT * FROM portfolio_positions WHERE plan_id = ?",
+                (event["plan_id"],),
+            ).fetchone()
+            holdings = Decimal(
+                position["actual_units"] if position is not None else cycle["actual_units"]
+            )
+            total_cost = (
+                Decimal(position["total_cost"])
+                if position is not None else
+                Decimal(cycle["cost_basis"] or "0") * holdings
+            )
+            average_cost = (
+                Decimal(position["average_cost"])
+                if position is not None and position["average_cost"] is not None
+                else Decimal(cycle["cost_basis"] or "0")
+            )
             if actual_sell_units > holdings:
                 raise ValueError("actual sell units cannot exceed current holdings")
             if bool(level["sell_all"]) and actual_sell_units != holdings:
@@ -2109,6 +2500,10 @@ class Database:
             before = Decimal(event["recurring_amount_before"])
             after = Decimal(level["next_recurring_amount"])
             remaining = holdings - actual_sell_units
+            remaining_cost = (
+                Decimal("0")
+                if remaining == 0 else total_cost - average_cost * actual_sell_units
+            )
             peak = max(
                 Decimal(event["quote_price"]),
                 Decimal(cycle["take_profit_peak"])
@@ -2144,6 +2539,19 @@ class Database:
                     ),
                     "recovering" if final else "active",
                     now, cycle["id"],
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE portfolio_positions
+                SET actual_units = ?, total_cost = ?, average_cost = ?,
+                    review_status = 'confirmed', updated_at = ?
+                WHERE plan_id = ?
+                """,
+                (
+                    str(remaining), str(remaining_cost),
+                    str(average_cost) if remaining else None,
+                    now, event["plan_id"],
                 ),
             )
             connection.execute(

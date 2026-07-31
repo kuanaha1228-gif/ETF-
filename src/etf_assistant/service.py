@@ -15,11 +15,10 @@ from .domain import (
     Quote,
     StrategyLevel,
     StrategyStage,
-    TakeProfitBasisStatus,
     ValuationStatus,
     ValuationType,
 )
-from .providers.market import MarketProvider, TradingCalendar
+from .providers.market import FundNavProvider, MarketProvider, TradingCalendar
 from .providers.notify import NotificationProvider
 from .strategy import (
     choose_level,
@@ -291,11 +290,13 @@ class DailyCheckService:
         market: MarketProvider,
         calendar: TradingCalendar,
         notifiers: list[NotificationProvider],
+        fund_nav_provider: FundNavProvider | None = None,
     ) -> None:
         self.database = database
         self.market = market
         self.calendar = calendar
         self.notifiers = notifiers
+        self.fund_nav_provider = fund_nav_provider
 
     def run(
         self,
@@ -322,6 +323,19 @@ class DailyCheckService:
 
         for plan in plans:
             plan_event_ids: list[UUID] = []
+            if self.fund_nav_provider is not None:
+                try:
+                    fund_nav = self.fund_nav_provider.latest_nav(plan.purchase_code)
+                    self.database.record_official_nav(
+                        plan.id,
+                        nav_date=fund_nav.nav_date,
+                        official_nav=fund_nav.unit_nav,
+                        daily_change=fund_nav.daily_change,
+                        source=fund_nav.source,
+                        fetched_at=fund_nav.fetched_at,
+                    )
+                except Exception as error:
+                    errors.append(f"{plan.purchase_code} 场外净值同步失败: {error}")
             try:
                 quote = quotes.get(plan.signal_code)
                 if quote is None:
@@ -343,6 +357,8 @@ class DailyCheckService:
                 strategy = self.database.get_active_strategy(plan.id)
                 active_drawdown = self.database.get_active_cycle(plan.id)
                 take_profit_cycle = self.database.current_take_profit_cycle(plan.id)
+                position = self.database.current_position(plan.id)
+                latest_nav = self.database.latest_official_nav(plan.id)
                 take_profit_levels = self.database.take_profit_levels(plan.id)
                 executed_take_profit = (
                     self.database.executed_take_profit_level_ids(
@@ -350,14 +366,12 @@ class DailyCheckService:
                     )
                     if take_profit_cycle else set()
                 )
-                locked_basis = bool(
+                position_ready = bool(
                     take_profit_cycle
-                    and take_profit_cycle["basis_status"]
-                    == TakeProfitBasisStatus.LOCKED.value
-                    and take_profit_cycle["cost_basis"] is not None
-                    and take_profit_cycle["previous_official_nav"] is not None
-                    and take_profit_cycle["previous_official_nav_date"] is not None
-                    and take_profit_cycle["basis_review_status"] == "confirmed"
+                    and position["average_cost"] is not None
+                    and Decimal(position["actual_units"]) > 0
+                    and position["review_status"] == "confirmed"
+                    and latest_nav is not None
                 )
                 regular = (
                     plan.recurring_amount
@@ -406,13 +420,11 @@ class DailyCheckService:
 
                 if (
                     scheduled
-                    and locked_basis
+                    and position_ready
                     and take_profit_cycle["state"] != "recovering"
                 ):
-                    cost_basis = Decimal(take_profit_cycle["cost_basis"])
-                    reference_nav = Decimal(
-                        take_profit_cycle["previous_official_nav"]
-                    )
+                    cost_basis = Decimal(position["average_cost"])
+                    reference_nav = Decimal(latest_nav["official_nav"])
                     estimated_nav, signal_return = estimate_linked_fund_nav(
                         reference_nav, signal_previous_close, quote.price
                     )
@@ -428,7 +440,7 @@ class DailyCheckService:
                         level = max(eligible, key=lambda item: item.profit_rate)
                         target = take_profit_target(cost_basis, level.profit_rate)
                         units = planned_sell_units(
-                            Decimal(take_profit_cycle["actual_units"]), level
+                            Decimal(position["actual_units"]), level
                         )
                         event_payload = {
                             "event_type": "take_profit",
@@ -455,7 +467,7 @@ class DailyCheckService:
                             "estimated_nav": estimated_nav,
                             "reference_nav": reference_nav,
                             "reference_nav_date": date.fromisoformat(
-                                take_profit_cycle["previous_official_nav_date"]
+                                latest_nav["nav_date"]
                             ),
                             "signal_previous_close": signal_previous_close,
                             "signal_intraday_return": signal_return,
@@ -747,7 +759,7 @@ class DailyCheckService:
                                 )
 
                 next_target = None
-                if locked_basis:
+                if position_ready:
                     remaining_levels = [
                         level
                         for level in take_profit_levels
@@ -756,7 +768,7 @@ class DailyCheckService:
                     if remaining_levels:
                         next_target = str(
                             take_profit_target(
-                                Decimal(take_profit_cycle["cost_basis"]),
+                                Decimal(position["average_cost"]),
                                 min(
                                     remaining_levels,
                                     key=lambda item: item.profit_rate,
