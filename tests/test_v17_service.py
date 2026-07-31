@@ -7,6 +7,7 @@ from uuid import UUID
 
 from etf_assistant.db import Database
 from etf_assistant.domain import (
+    FundNav,
     Plan,
     Quote,
     RecoveryLevel,
@@ -18,6 +19,14 @@ from etf_assistant.providers.market import StaticMarketProvider, WeekdayCalendar
 from etf_assistant.providers.notify import RecordingNotifier
 from etf_assistant.service import DailyCheckService
 from etf_assistant.strategy import default_strategy
+
+
+class StaticFundNavProvider:
+    def __init__(self, nav: FundNav) -> None:
+        self.nav = nav
+
+    def latest_nav(self, symbol: str) -> FundNav:
+        return self.nav
 
 
 class V17ServiceTests(TestCase):
@@ -156,6 +165,48 @@ class V17ServiceTests(TestCase):
         row = self.database.event_row(result.created_events[0])
         self.assertEqual(row["valuation_status"], "nav_confirmed")
         self.assertEqual(len(self.database.events_for_plan_date(plan.id, self.now.date())), 1)
+
+    def test_official_nav_crossing_is_reported_after_intraday_price_falls_back(
+        self,
+    ) -> None:
+        plan = self._a500()
+        next_day = self.now + timedelta(days=1)
+        official_nav = FundNav(
+            symbol=plan.purchase_code,
+            nav_date=self.now.date(),
+            unit_nav=Decimal("1.2"),
+            daily_change=Decimal("2"),
+            source="eastmoney",
+            fetched_at=next_day,
+        )
+        messages: list[tuple[str, str]] = []
+
+        result = DailyCheckService(
+            self.database,
+            self._market(plan.signal_code, "0.99", next_day),
+            WeekdayCalendar(),
+            [RecordingNotifier("desktop", messages)],
+            fund_nav_provider=StaticFundNavProvider(official_nav),
+        ).run(next_day)
+
+        self.assertEqual(len(result.created_events), 1)
+        event = self.database.event_row(result.created_events[0])
+        self.assertEqual(event["valuation_status"], "nav_confirmed")
+        self.assertEqual(event["official_nav"], "1.2")
+        self.assertEqual(event["official_nav_date"], self.now.date().isoformat())
+        self.assertEqual(event["estimated_nav"], "1.2")
+        self.assertIn("官方净值达到预设位置", messages[0][0])
+        self.assertIn("当前盘中可能已经回落", messages[0][1])
+
+        repeated = DailyCheckService(
+            self.database,
+            self._market(plan.signal_code, "0.98", next_day + timedelta(days=1)),
+            WeekdayCalendar(),
+            [RecordingNotifier("desktop", messages)],
+            fund_nav_provider=StaticFundNavProvider(official_nav),
+        ).run(next_day + timedelta(days=1))
+        self.assertEqual(repeated.created_events, ())
+        self.assertEqual(len(messages), 1)
 
     def test_legacy_locked_basis_without_official_nav_does_not_trigger(self) -> None:
         plan = Plan(

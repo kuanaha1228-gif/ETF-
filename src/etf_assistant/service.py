@@ -111,6 +111,23 @@ def _render_event(plan, row) -> tuple[str, str]:
     event_type = row["event_type"]
     if event_type == "take_profit":
         high_error = row["valuation_type"] == ValuationType.QDII_HIGH_ERROR.value
+        if row["valuation_status"] == ValuationStatus.NAV_CONFIRMED.value:
+            return (
+                f"【ETF止盈确认】{plan.name}官方净值达到预设位置",
+                (
+                    f"场外官方净值：{row['official_nav']}"
+                    f"（{row['official_nav_date']}）\n"
+                    f"本轮场外止盈基准：{row['take_profit_cost_basis']}\n"
+                    f"目标净值：{row['take_profit_target_price']}（收益"
+                    f"{row['threshold_snapshot']}%）\n"
+                    f"计划卖出：当前实际持仓的 {row['sell_ratio_snapshot']}%，"
+                    f"约 {row['planned_sell_units']} 份\n"
+                    f"确认实际卖出后，定投金额由 {row['recurring_amount_before']} 元"
+                    f"调整为 {row['recurring_amount_after']} 元。\n\n"
+                    "该提醒用于补充14:50后才达到的止盈位置；当前盘中可能已经回落，"
+                    "请结合最新行情自行决定是否执行。"
+                ),
+            )
         title = f"【ETF止盈预警】{plan.name}盘中估算达到预设位置"
         body = (
             f"观察 ETF：{plan.signal_name or plan.signal_code}（{plan.signal_code}）\n"
@@ -229,18 +246,28 @@ def _summary_text(
             regular_total += Decimal(event["regular_amount"])
             extra_total += Decimal(event["extra_amount"])
             if event["event_type"] == "take_profit":
-                lines.append(
-                    f"止盈预警：上一期官方净值 {event['reference_nav']}"
-                    f"（{event['reference_nav_date']}）｜场内昨收"
-                    f" {event['signal_previous_close']}｜盘中涨跌"
-                    f" {Decimal(event['signal_intraday_return']) * 100:.2f}%｜"
-                    f"场外估算净值 {event['estimated_nav']}｜基准"
-                    f" {event['take_profit_cost_basis']}｜目标净值"
-                    f" {event['take_profit_target_price']}｜估值状态"
-                    f" {event['valuation_status']}｜卖出"
-                    f" {event['sell_ratio_snapshot']}%（计划"
-                    f" {event['planned_sell_units']}份）"
-                )
+                if event["valuation_status"] == ValuationStatus.NAV_CONFIRMED.value:
+                    lines.append(
+                        f"止盈确认：官方净值 {event['official_nav']}"
+                        f"（{event['official_nav_date']}）｜基准"
+                        f" {event['take_profit_cost_basis']}｜目标净值"
+                        f" {event['take_profit_target_price']}｜卖出"
+                        f" {event['sell_ratio_snapshot']}%（计划"
+                        f" {event['planned_sell_units']}份）"
+                    )
+                else:
+                    lines.append(
+                        f"止盈预警：上一期官方净值 {event['reference_nav']}"
+                        f"（{event['reference_nav_date']}）｜场内昨收"
+                        f" {event['signal_previous_close']}｜盘中涨跌"
+                        f" {Decimal(event['signal_intraday_return']) * 100:.2f}%｜"
+                        f"场外估算净值 {event['estimated_nav']}｜基准"
+                        f" {event['take_profit_cost_basis']}｜目标净值"
+                        f" {event['take_profit_target_price']}｜估值状态"
+                        f" {event['valuation_status']}｜卖出"
+                        f" {event['sell_ratio_snapshot']}%（计划"
+                        f" {event['planned_sell_units']}份）"
+                    )
                 if event["valuation_type"] == ValuationType.QDII_HIGH_ERROR.value:
                     lines.append(
                         "高误差提示：该计划受交易时段、汇率、溢折价和跟踪误差"
@@ -425,19 +452,23 @@ class DailyCheckService:
                 ):
                     cost_basis = Decimal(position["average_cost"])
                     reference_nav = Decimal(latest_nav["official_nav"])
-                    estimated_nav, signal_return = estimate_linked_fund_nav(
-                        reference_nav, signal_previous_close, quote.price
-                    )
-                    eligible = [
+                    reference_nav_date = date.fromisoformat(latest_nav["nav_date"])
+                    official_eligible = [
                         level
                         for level in take_profit_levels
                         if level.id not in executed_take_profit
-                        and estimated_nav >= take_profit_target(
+                        and reference_nav_date < today
+                        and reference_nav >= take_profit_target(
                             cost_basis, level.profit_rate
                         )
+                        and not self.database.take_profit_event_exists_for_nav_date(
+                            plan.id, reference_nav_date, level.id
+                        )
                     ]
-                    if eligible:
-                        level = max(eligible, key=lambda item: item.profit_rate)
+                    if official_eligible:
+                        level = max(
+                            official_eligible, key=lambda item: item.profit_rate
+                        )
                         target = take_profit_target(cost_basis, level.profit_rate)
                         units = planned_sell_units(
                             Decimal(position["actual_units"]), level
@@ -450,9 +481,9 @@ class DailyCheckService:
                             "extra": Decimal("0.00"),
                             "key": event_key(
                                 plan.id,
-                                today,
+                                reference_nav_date,
                                 UUID(take_profit_cycle["id"]),
-                                f"take-profit:{level.id}",
+                                f"take-profit-official:{level.id}",
                             ),
                             "take_profit_cycle_id": UUID(take_profit_cycle["id"]),
                             "take_profit_level_id": level.id,
@@ -460,20 +491,72 @@ class DailyCheckService:
                             "take_profit_target_price": target,
                             "sell_ratio_snapshot": level.sell_ratio,
                             "planned_sell_units": units,
-                            "valuation_status": ValuationStatus.ESTIMATED_WARNING,
+                            "valuation_status": ValuationStatus.NAV_CONFIRMED,
                             "valuation_type": ValuationType(
                                 take_profit_cycle["valuation_type"]
                             ),
-                            "estimated_nav": estimated_nav,
+                            "estimated_nav": reference_nav,
                             "reference_nav": reference_nav,
-                            "reference_nav_date": date.fromisoformat(
-                                latest_nav["nav_date"]
-                            ),
-                            "signal_previous_close": signal_previous_close,
-                            "signal_intraday_return": signal_return,
+                            "reference_nav_date": reference_nav_date,
+                            "official_nav": reference_nav,
+                            "official_nav_date": reference_nav_date,
                             "recurring_amount_before": plan.recurring_amount,
                             "recurring_amount_after": level.next_recurring_amount,
                         }
+                    else:
+                        estimated_nav, signal_return = estimate_linked_fund_nav(
+                            reference_nav, signal_previous_close, quote.price
+                        )
+                        eligible = [
+                            level
+                            for level in take_profit_levels
+                            if level.id not in executed_take_profit
+                            and estimated_nav >= take_profit_target(
+                                cost_basis, level.profit_rate
+                            )
+                        ]
+                        if eligible:
+                            level = max(eligible, key=lambda item: item.profit_rate)
+                            target = take_profit_target(cost_basis, level.profit_rate)
+                            units = planned_sell_units(
+                                Decimal(position["actual_units"]), level
+                            )
+                            event_payload = {
+                                "event_type": "take_profit",
+                                "level": None,
+                                "threshold": level.profit_rate,
+                                "regular": regular,
+                                "extra": Decimal("0.00"),
+                                "key": event_key(
+                                    plan.id,
+                                    today,
+                                    UUID(take_profit_cycle["id"]),
+                                    f"take-profit:{level.id}",
+                                ),
+                                "take_profit_cycle_id": UUID(
+                                    take_profit_cycle["id"]
+                                ),
+                                "take_profit_level_id": level.id,
+                                "take_profit_cost_basis": cost_basis,
+                                "take_profit_target_price": target,
+                                "sell_ratio_snapshot": level.sell_ratio,
+                                "planned_sell_units": units,
+                                "valuation_status": (
+                                    ValuationStatus.ESTIMATED_WARNING
+                                ),
+                                "valuation_type": ValuationType(
+                                    take_profit_cycle["valuation_type"]
+                                ),
+                                "estimated_nav": estimated_nav,
+                                "reference_nav": reference_nav,
+                                "reference_nav_date": reference_nav_date,
+                                "signal_previous_close": signal_previous_close,
+                                "signal_intraday_return": signal_return,
+                                "recurring_amount_before": plan.recurring_amount,
+                                "recurring_amount_after": (
+                                    level.next_recurring_amount
+                                ),
+                            }
 
                 if (
                     scheduled
@@ -688,6 +771,8 @@ class DailyCheckService:
                         signal_intraday_return=event_payload.get(
                             "signal_intraday_return"
                         ),
+                        official_nav=event_payload.get("official_nav"),
+                        official_nav_date=event_payload.get("official_nav_date"),
                     )
                     if was_created:
                         created.append(event_id)

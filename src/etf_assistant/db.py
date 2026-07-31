@@ -878,6 +878,28 @@ class Database:
                 (str(plan_id), trading_date.isoformat()),
             ).fetchall()
 
+    def take_profit_event_exists_for_nav_date(
+        self, plan_id: UUID, nav_date: date, level_id: UUID
+    ) -> bool:
+        with self.read() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM events
+                WHERE plan_id = ?
+                  AND event_type = 'take_profit'
+                  AND take_profit_level_id = ?
+                  AND (trading_date = ? OR official_nav_date = ?)
+                LIMIT 1
+                """,
+                (
+                    str(plan_id),
+                    str(level_id),
+                    nav_date.isoformat(),
+                    nav_date.isoformat(),
+                ),
+            ).fetchone()
+        return row is not None
+
     def recurring_event_exists(self, plan_id: UUID, trading_date: date) -> bool:
         with self.read() as connection:
             row = connection.execute(
@@ -1155,6 +1177,8 @@ class Database:
         reference_nav_date: date | None = None,
         signal_previous_close: Decimal | None = None,
         signal_intraday_return: Decimal | None = None,
+        official_nav: Decimal | None = None,
+        official_nav_date: date | None = None,
     ) -> tuple[UUID, bool]:
         event_id = uuid4()
         now = utc_now_text()
@@ -1177,11 +1201,11 @@ class Database:
                     take_profit_target_price, sell_ratio_snapshot, planned_sell_units,
                     recurring_amount_before, recurring_amount_after,
                     valuation_status, valuation_type, estimated_nav, reference_nav, reference_nav_date,
-                    signal_previous_close, signal_intraday_return,
+                    signal_previous_close, signal_intraday_return, official_nav, official_nav_date,
                     state, execution_status, idempotency_key, created_at, updated_at
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -1225,6 +1249,8 @@ class Database:
                         str(signal_intraday_return)
                         if signal_intraday_return is not None else None
                     ),
+                    str(official_nav) if official_nav is not None else None,
+                    official_nav_date.isoformat() if official_nav_date else None,
                     state.value,
                     ExecutionStatus.UNKNOWN.value, idempotency_key, now, now,
                 ),
@@ -2106,6 +2132,10 @@ class Database:
                 SELECT id, take_profit_target_price FROM events
                 WHERE plan_id = ? AND trading_date = ?
                   AND event_type = 'take_profit'
+                  AND (
+                      official_nav_date IS NULL
+                      OR official_nav_date = trading_date
+                  )
                 """,
                 (str(plan_id), nav_date.isoformat()),
             ).fetchall()

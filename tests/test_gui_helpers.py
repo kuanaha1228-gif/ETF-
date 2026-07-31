@@ -85,6 +85,10 @@ class GuiHelperTests(unittest.TestCase):
         self.assertIn("当前持仓与止盈", html)
         self.assertIn("精确止盈位置", html)
         self.assertIn("当前阶段定投金额", html)
+        self.assertIn(
+            "$('current-amount').oninput=()=>{$('amount-update-mode').value='explicit_current'}",
+            html,
+        )
         self.assertIn('id="tp-actual-units" type="text" inputmode="decimal"', html)
         self.assertIn("当前实际持有份额必须是非负数字，最多 6 位小数", html)
         self.assertIn("记录实际赎回", html)
